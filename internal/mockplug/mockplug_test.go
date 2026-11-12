@@ -99,7 +99,7 @@ func TestSetRelayStateRejectsBadArguments(t *testing.T) {
 func TestSeveralCommandsInOneRequest(t *testing.T) {
 	plug := startPlug(t)
 	reply := send(t, plug.Addr(),
-		`{"system":{"set_relay_state":{"state":1},"get_sysinfo":{}},"time":{"get_time":null}}`)
+		`{"system":{"set_relay_state":{"state":1},"get_sysinfo":{}},"time":{"get_time":{}},"emeter":{"get_realtime":{}}}`)
 
 	if code := errCode(t, methods(t, reply["system"])["set_relay_state"]); code != 0 {
 		t.Errorf("set_relay_state err_code = %d, want 0", code)
@@ -107,11 +107,112 @@ func TestSeveralCommandsInOneRequest(t *testing.T) {
 	if code := errCode(t, methods(t, reply["system"])["get_sysinfo"]); code != 0 {
 		t.Errorf("get_sysinfo err_code = %d, want 0", code)
 	}
-	if code := errCode(t, reply["time"]); code != -1 {
+	if code := errCode(t, methods(t, reply["time"])["get_time"]); code != 0 {
+		t.Errorf("get_time err_code = %d, want 0", code)
+	}
+	if code := errCode(t, reply["emeter"]); code != -1 {
 		t.Errorf("unsupported module err_code = %d, want -1", code)
 	}
 	if !plug.RelayOn() {
 		t.Error("relay is off after set_relay_state 1")
+	}
+	if got := plug.Requests(); got != 1 {
+		t.Errorf("plug counted %d requests, want 1", got)
+	}
+}
+
+func TestTimeModule(t *testing.T) {
+	plug := startPlug(t)
+	fixed := time.Date(2001, time.February, 3, 4, 5, 6, 0, time.UTC)
+	plug.SetClock(func() time.Time { return fixed })
+	plug.SetTimezoneIndex(7)
+
+	reply := send(t, plug.Addr(), `{"time":{"get_time":{},"get_timezone":{},"set_alarm":{}}}`)
+	results := methods(t, reply["time"])
+
+	var got struct {
+		Year, Month, Hour int
+		Day               int `json:"mday"`
+		Minute            int `json:"min"`
+		Second            int `json:"sec"`
+	}
+	if err := json.Unmarshal(results["get_time"], &got); err != nil {
+		t.Fatalf("decode get_time: %v", err)
+	}
+	if got.Year != 2001 || got.Month != 2 || got.Day != 3 || got.Hour != 4 || got.Minute != 5 || got.Second != 6 {
+		t.Errorf("get_time = %+v, want 2001-02-03 04:05:06", got)
+	}
+
+	var zone struct {
+		Index int `json:"index"`
+	}
+	if err := json.Unmarshal(results["get_timezone"], &zone); err != nil {
+		t.Fatalf("decode get_timezone: %v", err)
+	}
+	if zone.Index != 7 {
+		t.Errorf("timezone index = %d, want 7", zone.Index)
+	}
+
+	if code := errCode(t, results["set_alarm"]); code != -2 {
+		t.Errorf("unknown time method err_code = %d, want -2", code)
+	}
+}
+
+// fakeClock is a clock that only moves when told to.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+func TestOnTimeCountsFromSwitchOn(t *testing.T) {
+	plug := startPlug(t)
+	clock := &fakeClock{now: time.Date(2001, time.February, 3, 4, 5, 6, 0, time.UTC)}
+	plug.SetClock(clock.Now)
+
+	onTime := func() int {
+		t.Helper()
+		reply := send(t, plug.Addr(), `{"system":{"get_sysinfo":{}}}`)
+		var info struct {
+			OnTime int `json:"on_time"`
+		}
+		if err := json.Unmarshal(methods(t, reply["system"])["get_sysinfo"], &info); err != nil {
+			t.Fatalf("decode sysinfo: %v", err)
+		}
+		return info.OnTime
+	}
+
+	if got := onTime(); got != 0 {
+		t.Errorf("on_time while off = %d, want 0", got)
+	}
+
+	plug.SetRelay(true)
+	clock.Advance(90 * time.Second)
+	if got := onTime(); got != 90 {
+		t.Errorf("on_time 90s after switching on = %d, want 90", got)
+	}
+
+	// Switching on again must not restart the count.
+	plug.SetRelay(true)
+	clock.Advance(10 * time.Second)
+	if got := onTime(); got != 100 {
+		t.Errorf("on_time after a repeated on = %d, want 100", got)
+	}
+
+	plug.SetRelay(false)
+	if got := onTime(); got != 0 {
+		t.Errorf("on_time after switching off = %d, want 0", got)
 	}
 }
 
@@ -207,5 +308,65 @@ func TestCloseDropsOpenConnections(t *testing.T) {
 	}
 	if err := plug.Close(); err != nil {
 		t.Errorf("second Close: %v", err)
+	}
+}
+
+func TestSetTime(t *testing.T) {
+	plug := startPlug(t)
+	clock := &fakeClock{now: time.Date(2001, time.February, 3, 4, 5, 6, 0, time.UTC)}
+	plug.SetClock(clock.Now)
+
+	reply := send(t, plug.Addr(),
+		`{"time":{"set_time":{"year":2010,"month":11,"mday":12,"hour":13,"min":14,"sec":15}}}`)
+	if code := errCode(t, methods(t, reply["time"])["set_time"]); code != 0 {
+		t.Fatalf("set_time err_code = %d, want 0", code)
+	}
+	want := time.Date(2010, time.November, 12, 13, 14, 15, 0, time.UTC)
+	if got := plug.Time(); !got.Equal(want) {
+		t.Errorf("plug time after set_time = %v, want %v", got, want)
+	}
+
+	// The clock keeps running from the time it was set to.
+	clock.Advance(45 * time.Second)
+	if got, want := plug.Time(), want.Add(45*time.Second); !got.Equal(want) {
+		t.Errorf("plug time 45s later = %v, want %v", got, want)
+	}
+
+	reply = send(t, plug.Addr(), `{"time":{"get_time":{}}}`)
+	var got struct {
+		Year   int `json:"year"`
+		Minute int `json:"min"`
+		Second int `json:"sec"`
+	}
+	if err := json.Unmarshal(methods(t, reply["time"])["get_time"], &got); err != nil {
+		t.Fatalf("decode get_time: %v", err)
+	}
+	if got.Year != 2010 || got.Minute != 15 || got.Second != 0 {
+		t.Errorf("get_time after set_time = %+v, want 2010, minute 15, second 0", got)
+	}
+}
+
+func TestSetTimeRejectsBadArguments(t *testing.T) {
+	plug := startPlug(t)
+	start := time.Date(2001, time.February, 3, 4, 5, 6, 0, time.UTC)
+	plug.SetClock(func() time.Time { return start })
+
+	requests := []string{
+		`{"time":{"set_time":{}}}`,
+		`{"time":{"set_time":null}}`,
+		`{"time":{"set_time":{"year":2010,"month":11,"mday":12,"hour":13,"min":14}}}`,
+		`{"time":{"set_time":{"year":2010,"month":13,"mday":12,"hour":13,"min":14,"sec":15}}}`,
+		`{"time":{"set_time":{"year":2010,"month":2,"mday":30,"hour":13,"min":14,"sec":15}}}`,
+		`{"time":{"set_time":{"year":2010,"month":11,"mday":12,"hour":24,"min":14,"sec":15}}}`,
+		`{"time":{"set_time":{"year":"2010","month":11,"mday":12,"hour":13,"min":14,"sec":15}}}`,
+	}
+	for _, request := range requests {
+		reply := send(t, plug.Addr(), request)
+		if code := errCode(t, methods(t, reply["time"])["set_time"]); code != -3 {
+			t.Errorf("%s: err_code = %d, want -3", request, code)
+		}
+	}
+	if got := plug.Time(); !got.Equal(start) {
+		t.Errorf("a rejected set_time moved the clock to %v", got)
 	}
 }

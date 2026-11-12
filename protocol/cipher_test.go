@@ -49,7 +49,7 @@ func TestCipherRoundTrip(t *testing.T) {
 		"zeros":          make([]byte, 16),
 		"every byte":     allBytes,
 		"relay request":  []byte(`{"system":{"set_relay_state":{"state":1}}}`),
-		"non-ASCII text": []byte(`{"alias":"Garagentür – links"}`),
+		"non-ASCII text": []byte(`{"alias":"Café – été"}`),
 	}
 	for name, plaintext := range cases {
 		t.Run(name, func(t *testing.T) {
