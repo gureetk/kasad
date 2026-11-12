@@ -334,3 +334,39 @@ func TestSetClockSendsWallClockFields(t *testing.T) {
 		t.Errorf("mock wall clock after SetClock = %v, want 2010-11-12 13:14:15", got)
 	}
 }
+
+func TestSwitch(t *testing.T) {
+	mock := startMock(t)
+	p := New(mock.Addr())
+	ctx := context.Background()
+
+	for _, on := range []bool{true, false} {
+		info, err := p.Switch(ctx, on)
+		if err != nil {
+			t.Fatalf("Switch(%v): %v", on, err)
+		}
+		if info.On() != on || mock.RelayOn() != on {
+			t.Errorf("after Switch(%v): reported on = %v, mock relay on = %v", on, info.On(), mock.RelayOn())
+		}
+		if info.Alias != "Mock Plug" {
+			t.Errorf("Switch returned sysinfo with alias %q", info.Alias)
+		}
+	}
+}
+
+func TestSwitchNoticesARelayThatDoesNotMove(t *testing.T) {
+	mock := startMock(t)
+	mock.SetStuck(true)
+
+	info, err := New(mock.Addr()).Switch(context.Background(), true)
+	if !errors.Is(err, ErrNotSwitched) {
+		t.Fatalf("Switch on a stuck relay = %v, want ErrNotSwitched", err)
+	}
+	if info.On() {
+		t.Error("Switch reported the relay on although it did not move")
+	}
+	var deviceErr *Error
+	if errors.As(err, &deviceErr) {
+		t.Errorf("a relay that did not move was reported as a device error: %v", err)
+	}
+}

@@ -12,8 +12,9 @@ Early. What works today:
 - switch the relay on and off
 - set the plug's clock from the machine kasad runs on
 - run a weekly on/off schedule, as a long-running service
+- offer a JSON API for the plug and the schedule
 
-Planned: a JSON API and a small web interface served by the same binary.
+Planned: a small web interface served by the same binary.
 
 ## Build
 
@@ -85,8 +86,9 @@ does to standard error.
 
 Each rule needs a unique `id`, the `days` it applies on, a 24-hour `time`, and
 an `action` of `on` or `off`. `name` and `disabled` are optional. Times are in
-the local timezone of the machine running kasad. The schedule is read once,
-at start, so restart `serve` after editing the file.
+the local timezone of the machine running kasad. The file is read once, at
+start, so restart `serve` after editing it by hand. A schedule changed through
+the API takes effect at once and is written back to the file.
 
 How `serve` behaves:
 
@@ -95,7 +97,8 @@ How `serve` behaves:
   since the latest decides what state the plug should be in. Progress is kept
   in `state.json` in the data directory.
 - **Changed schedules.** A new or edited schedule takes effect from the moment
-  `serve` starts. Rules are never applied retroactively.
+  `serve` sees it: at start for a file edited by hand, straight away for a
+  change made through the API. Rules are never applied retroactively.
 - **Failures.** If the plug cannot be reached, `serve` retries every 30
   seconds until it succeeds or a later rule takes over.
 - **Clock changes.** When clocks go forward, a rule in the skipped hour fires
@@ -125,13 +128,60 @@ it off. Without `serve`, the `sync` command does the same job from cron:
 The plug keeps local time with no UTC offset. `state`, `sync` and `serve`
 assume the plug is set to the same timezone as the machine running kasad.
 
+## JSON API
+
+`serve` offers an HTTP API when given an address to listen on:
+
+```
+kasad -host 192.0.2.10 -data /var/lib/kasad -listen 127.0.0.1:8080 serve
+```
+
+| Request | What it does |
+|---|---|
+| `GET /api/status` | The plug's state and clock, and the next scheduled event |
+| `POST /api/relay` | Switch the plug: send `{"on": true}` or `{"on": false}` |
+| `GET /api/schedule` | The schedule, in the same form as `schedule.json` |
+| `PUT /api/schedule` | Replace the whole schedule |
+
+```
+curl http://127.0.0.1:8080/api/status
+curl -X POST -H 'Content-Type: application/json' -d '{"on": true}' http://127.0.0.1:8080/api/relay
+curl -X PUT -H 'Content-Type: application/json' --data @schedule.json http://127.0.0.1:8080/api/schedule
+```
+
+Responses are JSON. An error has the form `{"error": "..."}` with a fitting
+status code: 400 for a request that is wrong, 502 when the plug could not be
+reached or did not switch. `GET /api/status` still answers 200 when the plug
+is unreachable, with `"reachable": false`, because the rest of the answer
+does not depend on the plug.
+
+Requests that change something must be sent as `application/json`.
+
+### Who can use the API
+
+Without `-listen` there is no API. With it, anyone who can reach the address
+can switch the plug and change the schedule, so choose the address with care:
+`127.0.0.1` keeps the API to the machine itself.
+
+To require a token, set `KASAD_TOKEN` in the environment of `serve`. Every
+request must then carry it:
+
+```
+curl -H 'Authorization: Bearer the-token' http://192.0.2.20:8080/api/status
+```
+
+Set a token whenever the API listens on an address other machines can reach.
+`serve` logs a warning if it does not have one. The API is plain HTTP, so on
+a network you do not trust, put it behind something that adds TLS.
+
 ## Layout
 
 - `protocol`: the wire protocol, which is JSON obfuscated with an autokey XOR
   cipher and sent with a 4-byte length prefix.
 - `plug`: typed commands built on `protocol`.
-- `schedule`: rules, the calculation of when they fall due, and the loop that
-  applies them.
+- `schedule`: rules, the calculation of when they fall due, the loop that
+  applies them, and the file-backed store they are kept in.
+- `internal/api`: the JSON API.
 - `cmd/kasad`: the command-line tool.
 - `internal/mockplug`: an in-memory mock plug, so the tests run without
   hardware.

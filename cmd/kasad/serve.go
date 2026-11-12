@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/gureetk/kasad/internal/api"
 	"github.com/gureetk/kasad/plug"
 	"github.com/gureetk/kasad/schedule"
 )
@@ -21,19 +24,31 @@ const (
 	stateFile    = "state.json"
 )
 
+// tokenEnv names the environment variable that holds the API token. It is
+// read from the environment, not from a flag, so that it does not show up in
+// the process list.
+const tokenEnv = "KASAD_TOKEN"
+
 // clockRetryInterval is how long serve waits before trying again after it
 // could not set the plug's clock.
 const clockRetryInterval = time.Minute
 
+// shutdownTimeout is how long serve gives requests in progress to finish
+// when it stops.
+const shutdownTimeout = 5 * time.Second
+
 type serveOptions struct {
 	dataDir      string
 	syncInterval time.Duration // zero means never set the plug's clock
+	listen       string        // empty means no API
+	token        string        // empty means the API asks for no token
 }
 
-// serve runs the schedule in the data directory against the plug, and keeps
-// the plug's clock set, until ctx ends.
+// serve runs the schedule in the data directory against the plug, keeps the
+// plug's clock set and, if asked to, serves the API, until ctx ends.
 func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment) error {
-	logger := slog.New(slog.NewTextHandler(env.stderr, nil))
+	handler := slog.NewTextHandler(env.stderr, nil)
+	logger := slog.New(handler)
 
 	if info, err := os.Stat(opts.dataDir); err != nil {
 		return fmt.Errorf("data directory: %w", err)
@@ -42,14 +57,25 @@ func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment
 	}
 
 	schedulePath := filepath.Join(opts.dataDir, scheduleFile)
-	rules, err := schedule.Load(schedulePath)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		logger.Warn("no schedule file, running with no rules", "path", schedulePath)
-	case err != nil:
+	if _, err := os.Stat(schedulePath); errors.Is(err, fs.ErrNotExist) {
+		logger.Warn("no schedule file, starting with no rules", "path", schedulePath)
+	}
+	store, err := schedule.OpenStore(schedulePath)
+	if err != nil {
 		return err
 	}
 
+	// Claim the API's address before anything else starts, so that a bad
+	// address or a port already in use stops serve at once.
+	var listener net.Listener
+	if opts.listen != "" {
+		listener, err = net.Listen("tcp", opts.listen)
+		if err != nil {
+			return fmt.Errorf("API: %w", err)
+		}
+	}
+
+	rules := store.Schedule()
 	enabled := 0
 	for _, rule := range rules.Rules {
 		if !rule.Disabled {
@@ -64,8 +90,47 @@ func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
 	var background sync.WaitGroup
+
+	if listener != nil {
+		server := &http.Server{
+			Handler: (&api.Server{
+				Plug:   p,
+				Store:  store,
+				Token:  opts.token,
+				Now:    env.now,
+				Logger: logger,
+			}).Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+			ErrorLog:          slog.NewLogLogger(handler, slog.LevelWarn),
+		}
+		logger.Info("serving the API", "addr", listener.Addr().String(), "token", opts.token != "")
+		if opts.token == "" && !isLoopback(listener.Addr()) {
+			logger.Warn("the API can be reached from other machines and asks for no token; set " + tokenEnv + " to require one")
+		}
+
+		background.Add(2)
+		go func() {
+			defer background.Done()
+			if err := server.Serve(listener); !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("the API stopped unexpectedly", "error", err)
+				cancel()
+			}
+		}()
+		go func() {
+			defer background.Done()
+			<-ctx.Done()
+			shutdownCtx, stop := context.WithTimeout(context.Background(), shutdownTimeout)
+			defer stop()
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				server.Close()
+			}
+		}()
+	}
+
 	if opts.syncInterval > 0 {
 		background.Add(1)
 		go func() {
@@ -75,13 +140,14 @@ func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment
 	}
 
 	runner := &schedule.Runner{
-		Schedule:      rules,
+		Schedule:      store.Schedule,
+		Wake:          store.Changes(),
 		State:         schedule.StateFile{Path: filepath.Join(opts.dataDir, stateFile)},
 		Now:           env.now,
 		Logger:        logger,
 		CheckInterval: env.checkInterval,
 		Apply: func(ctx context.Context, event schedule.Event) error {
-			_, err := switchAndConfirm(ctx, p, event.Rule.Action == schedule.On)
+			_, err := p.Switch(ctx, event.Rule.Action == schedule.On)
 			return err
 		},
 	}
@@ -91,6 +157,16 @@ func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment
 	background.Wait()
 	logger.Info("stopped")
 	return err
+}
+
+// isLoopback reports whether addr can only be reached from this machine.
+func isLoopback(addr net.Addr) bool {
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // keepClockSet sets the plug's clock from this machine's, now and then every

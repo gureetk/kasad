@@ -34,6 +34,7 @@ type Plug struct {
 
 	mu          sync.Mutex
 	relayOn     bool
+	stuck       bool
 	onSince     time.Time
 	now         func() time.Time
 	clockOffset time.Duration
@@ -85,6 +86,14 @@ func (p *Plug) setRelayLocked(on bool) {
 		p.onSince = p.now()
 	}
 	p.relayOn = on
+}
+
+// SetStuck makes the plug accept relay commands without acting on them, as
+// a device with a failed relay might.
+func (p *Plug) SetStuck(stuck bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stuck = stuck
 }
 
 // SetClock replaces the plug's clock source and forgets any earlier set_time.
@@ -258,7 +267,9 @@ func (p *Plug) systemLocked(method string, args json.RawMessage) any {
 			(*params.State != 0 && *params.State != 1) {
 			return status{Code: errInvalidArgument, Message: "invalid argument"}
 		}
-		p.setRelayLocked(*params.State == 1)
+		if !p.stuck {
+			p.setRelayLocked(*params.State == 1)
+		}
 		return status{}
 	default:
 		return methodNotSupported

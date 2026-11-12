@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -66,6 +70,12 @@ type serving struct {
 // and extra flags. The clock starts at testNow.
 func startServe(t *testing.T, mock *mockplug.Plug, dir string, flags ...string) *serving {
 	t.Helper()
+	return startServeWithEnv(t, mock, dir, nil, flags...)
+}
+
+// startServeWithEnv is startServe with environment variables set.
+func startServeWithEnv(t *testing.T, mock *mockplug.Plug, dir string, vars map[string]string, flags ...string) *serving {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &serving{
 		t:      t,
@@ -82,7 +92,7 @@ func startServe(t *testing.T, mock *mockplug.Plug, dir string, flags ...string) 
 		s.done <- run(ctx, args, environment{
 			stdout:        s.stdout,
 			stderr:        s.stderr,
-			getenv:        func(string) string { return "" },
+			getenv:        func(name string) string { return vars[name] },
 			now:           s.clock.Now,
 			checkInterval: 2 * time.Millisecond,
 		})
@@ -363,5 +373,164 @@ func TestStateFileIsReadableJSON(t *testing.T) {
 		if _, ok := fields[key]; !ok {
 			t.Errorf("state file has no %q field:\n%s", key, data)
 		}
+	}
+}
+
+var apiAddrPattern = regexp.MustCompile(`msg="serving the API" addr=(\S+)`)
+
+// apiURL waits for serve to say where its API is and returns the URL of path
+// there.
+func (s *serving) apiURL(path string) string {
+	s.t.Helper()
+	s.waitForLog("serving the API")
+	match := apiAddrPattern.FindStringSubmatch(s.stderr.String())
+	if match == nil {
+		s.t.Fatalf("could not find the API address in the log:\n%s", s.stderr.String())
+	}
+	return "http://" + match[1] + path
+}
+
+// request sends an API request and returns the status code and body.
+func (s *serving) request(method, path, body string, headers map[string]string) (int, string) {
+	s.t.Helper()
+	request, err := http.NewRequest(method, s.apiURL(path), strings.NewReader(body))
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	if body != "" {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		s.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		s.t.Fatalf("%s %s: read body: %v", method, path, err)
+	}
+	return response.StatusCode, string(data)
+}
+
+func TestServeOffersNoAPIUnlessAsked(t *testing.T) {
+	mock := startMock(t)
+	s := startServe(t, mock, t.TempDir(), "-sync-interval", "0")
+	s.waitForLog("starting")
+	s.settle()
+	s.stop()
+	if strings.Contains(s.stderr.String(), "serving the API") {
+		t.Errorf("serve started the API without -listen:\n%s", s.stderr.String())
+	}
+}
+
+func TestServeAPI(t *testing.T) {
+	mock := startMock(t)
+	s := startServe(t, mock, t.TempDir(), "-sync-interval", "0", "-listen", "127.0.0.1:0")
+
+	code, body := s.request("GET", "/api/status", "", nil)
+	if code != http.StatusOK || !strings.Contains(body, `"reachable": true`) {
+		t.Errorf("GET /api/status = %d:\n%s", code, body)
+	}
+
+	code, body = s.request("POST", "/api/relay", `{"on": true}`, nil)
+	if code != http.StatusOK {
+		t.Errorf("POST /api/relay = %d:\n%s", code, body)
+	}
+	if !mock.RelayOn() {
+		t.Error("the plug was not switched on through the API")
+	}
+
+	if code := s.stop(); code != exitOK {
+		t.Errorf("exit code = %d, want %d. Log:\n%s", code, exitOK, s.stderr.String())
+	}
+	// Loopback only, so no warning about an open API.
+	if strings.Contains(s.stderr.String(), "asks for no token") {
+		t.Errorf("serve warned about an API that only this machine can reach:\n%s", s.stderr.String())
+	}
+}
+
+func TestServeAPIScheduleChangeNeedsNoRestart(t *testing.T) {
+	mock := startMock(t)
+	dir := t.TempDir()
+	s := startServe(t, mock, dir, "-sync-interval", "0", "-listen", "127.0.0.1:0")
+	s.waitForLog("starting from now")
+
+	code, body := s.request("PUT", "/api/schedule", soonSchedule, nil)
+	if code != http.StatusOK {
+		t.Fatalf("PUT /api/schedule = %d:\n%s", code, body)
+	}
+	// Wait for the scheduler to take the new schedule on before moving the
+	// clock: a schedule starts from the moment it is noticed.
+	s.waitFor("the scheduler to notice the new schedule", func() bool {
+		return strings.Count(s.stderr.String(), "starting from now") == 2
+	})
+
+	s.clock.Set(at(4, 6))
+	s.waitFor("the plug to be switched on", mock.RelayOn)
+	s.waitForLog("rule=soon-on")
+	s.stop()
+
+	saved, err := schedule.Load(filepath.Join(dir, scheduleFile))
+	if err != nil {
+		t.Fatalf("the schedule file was not written: %v", err)
+	}
+	if len(saved.Rules) != 2 {
+		t.Errorf("the schedule file holds %d rules, want 2", len(saved.Rules))
+	}
+}
+
+func TestServeAPIToken(t *testing.T) {
+	mock := startMock(t)
+	vars := map[string]string{tokenEnv: "s3cret"}
+	s := startServeWithEnv(t, mock, t.TempDir(), vars, "-sync-interval", "0", "-listen", "127.0.0.1:0")
+
+	if code, body := s.request("GET", "/api/status", "", nil); code != http.StatusUnauthorized {
+		t.Errorf("without the token: %d:\n%s", code, body)
+	}
+	if code, body := s.request("GET", "/api/status", "", map[string]string{"Authorization": "Bearer s3cret"}); code != http.StatusOK {
+		t.Errorf("with the token: %d:\n%s", code, body)
+	}
+	s.stop()
+	if strings.Contains(s.stderr.String(), "s3cret") {
+		t.Errorf("the token appears in the log:\n%s", s.stderr.String())
+	}
+}
+
+func TestServeWarnsAboutAnOpenAPI(t *testing.T) {
+	mock := startMock(t)
+
+	open := startServe(t, mock, t.TempDir(), "-sync-interval", "0", "-listen", "0.0.0.0:0")
+	open.waitForLog("serving the API")
+	open.waitForLog("asks for no token")
+	open.stop()
+
+	vars := map[string]string{tokenEnv: "s3cret"}
+	guarded := startServeWithEnv(t, mock, t.TempDir(), vars, "-sync-interval", "0", "-listen", "0.0.0.0:0")
+	guarded.waitForLog("serving the API")
+	guarded.settle()
+	guarded.stop()
+	if strings.Contains(guarded.stderr.String(), "asks for no token") {
+		t.Errorf("serve warned about an API that has a token:\n%s", guarded.stderr.String())
+	}
+}
+
+func TestServeFailsWhenTheAPIAddressIsTaken(t *testing.T) {
+	mock := startMock(t)
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer taken.Close()
+
+	got := kasad(t, nil, "-host", mock.Addr(), "-data", t.TempDir(), "-listen", taken.Addr().String(), "serve")
+	if got.code != exitFailed || !strings.Contains(got.stderr, "API:") {
+		t.Errorf("exit code = %d, stderr = %q", got.code, got.stderr)
+	}
+	if mock.Requests() != 0 {
+		t.Errorf("serve contacted the plug %d times before failing to start", mock.Requests())
 	}
 }
