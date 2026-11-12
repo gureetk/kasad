@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gureetk/kasad/plug"
@@ -22,9 +23,10 @@ Commands:
   on      switch the relay on
   off     switch the relay off
   sync    set the plug's clock from this machine's clock
+  serve   run the schedule in the data directory, and keep the plug's clock set
 
-The plug keeps local time with no UTC offset. state and sync assume that the
-plug is set to the same timezone as this machine.
+The plug keeps local time with no UTC offset. state, sync and serve assume
+that the plug is set to the same timezone as this machine.
 
 Flags:
 `
@@ -47,10 +49,14 @@ type environment struct {
 	stderr io.Writer
 	getenv func(string) string
 	now    func() time.Time
+
+	// checkInterval overrides how often serve looks at the clock. Zero
+	// means the scheduler's default.
+	checkInterval time.Duration
 }
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := run(ctx, os.Args[1:], environment{
 		stdout: os.Stdout,
 		stderr: os.Stderr,
@@ -66,6 +72,8 @@ func run(ctx context.Context, args []string, env environment) int {
 	flags.SetOutput(env.stderr)
 	host := flags.String("host", "", "plug address, as host or host:port (default: $"+hostEnv+")")
 	timeout := flags.Duration("timeout", protocol.DefaultTimeout, "how long to wait for the plug to answer")
+	dataDir := flags.String("data", ".", "serve: directory holding "+scheduleFile+", and where progress is saved")
+	syncInterval := flags.Duration("sync-interval", time.Hour, "serve: how often to set the plug's clock (0 to never set it)")
 	flags.Usage = func() {
 		fmt.Fprint(env.stderr, usage)
 		flags.PrintDefaults()
@@ -88,7 +96,7 @@ func run(ctx context.Context, args []string, env environment) int {
 	}
 	command := flags.Arg(0)
 	switch command {
-	case "state", "on", "off", "sync":
+	case "state", "on", "off", "sync", "serve":
 	default:
 		fmt.Fprintf(env.stderr, "kasad: unknown command %q\n", command)
 		flags.Usage()
@@ -106,6 +114,10 @@ func run(ctx context.Context, args []string, env environment) int {
 		fmt.Fprintln(env.stderr, "kasad: -timeout must be positive")
 		return exitUsage
 	}
+	if *syncInterval < 0 {
+		fmt.Fprintln(env.stderr, "kasad: -sync-interval must not be negative")
+		return exitUsage
+	}
 
 	p := plug.New(*host)
 	p.Client.Timeout = *timeout
@@ -120,6 +132,8 @@ func run(ctx context.Context, args []string, env environment) int {
 		err = switchRelay(ctx, p, false, env)
 	case "sync":
 		err = syncClock(ctx, p, env)
+	case "serve":
+		err = serve(ctx, p, serveOptions{dataDir: *dataDir, syncInterval: *syncInterval}, env)
 	}
 	if err != nil {
 		fmt.Fprintf(env.stderr, "kasad: %v\n", err)
@@ -187,21 +201,30 @@ func formatOffset(offset time.Duration) string {
 	return offset.String()
 }
 
-// switchRelay turns the relay on or off, then reads the state back to confirm
-// that the plug did it.
+// switchRelay turns the relay on or off and reports the result.
 func switchRelay(ctx context.Context, p *plug.Plug, on bool, env environment) error {
-	if err := p.SetRelay(ctx, on); err != nil {
-		return err
-	}
-	info, err := p.Sysinfo(ctx)
+	info, err := switchAndConfirm(ctx, p, on)
 	if err != nil {
-		return fmt.Errorf("sent the command, but could not confirm the new state: %w", err)
-	}
-	if info.On() != on {
-		return fmt.Errorf("%s accepted the command but is still %s", info.Alias, onOff(info.On()))
+		return err
 	}
 	fmt.Fprintf(env.stdout, "%s is %s\n", info.Alias, onOff(on))
 	return nil
+}
+
+// switchAndConfirm turns the relay on or off, then reads the state back to
+// confirm that the plug did it.
+func switchAndConfirm(ctx context.Context, p *plug.Plug, on bool) (plug.Sysinfo, error) {
+	if err := p.SetRelay(ctx, on); err != nil {
+		return plug.Sysinfo{}, err
+	}
+	info, err := p.Sysinfo(ctx)
+	if err != nil {
+		return plug.Sysinfo{}, fmt.Errorf("sent the command, but could not confirm the new state: %w", err)
+	}
+	if info.On() != on {
+		return info, fmt.Errorf("%s accepted the command but is still %s", info.Alias, onOff(info.On()))
+	}
+	return info, nil
 }
 
 // syncClock sets the plug's clock to this machine's local time, then reads it
