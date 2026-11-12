@@ -1,0 +1,32 @@
+# Sample systemd unit for kasad.
+#
+# 1. Install the binary as /usr/local/bin/kasad.
+# 2. Copy this file to /etc/systemd/system/kasad.service and set KASAD_HOST
+#    to the plug's address.
+# 3. Run: systemctl daemon-reload && systemctl enable --now kasad
+# 4. Put the schedule in /var/lib/kasad/schedule.json, then run:
+#    systemctl restart kasad
+#
+# Logs go to the journal: journalctl -u kasad
+
+[Unit]
+Description=kasad smart plug scheduler
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Environment=KASAD_HOST=192.0.2.10
+ExecStart=/usr/local/bin/kasad -data /var/lib/kasad serve
+Restart=on-failure
+RestartSec=5
+
+# Run as a throwaway user whose only writable directory is /var/lib/kasad.
+DynamicUser=yes
+StateDirectory=kasad
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -8,18 +8,25 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/gureetk/kasad/protocol"
 )
 
 // Plug is a handle on one device. Create one with New.
+//
+// A Plug is safe for concurrent use. It carries out one exchange at a time,
+// so the device never has two requests to deal with at once.
 type Plug struct {
 	// Addr is the device's address as host:port.
 	Addr string
 
 	// Client performs the network exchanges. Its zero value uses the
-	// default timeout.
+	// default timeout. Set it up before the Plug is shared.
 	Client protocol.Client
+
+	// exchange is held for the length of each exchange with the device.
+	exchange sync.Mutex
 }
 
 // New returns a Plug for the device at host. host is either a host name or
@@ -85,7 +92,9 @@ func (p *Plug) call(ctx context.Context, commands ...command) error {
 		return fmt.Errorf("plug: encode request: %w", err)
 	}
 
+	p.exchange.Lock()
 	raw, err := p.Client.Send(ctx, p.Addr, encoded)
+	p.exchange.Unlock()
 	if err != nil {
 		return err
 	}
