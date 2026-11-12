@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gureetk/kasad/internal/api"
+	"github.com/gureetk/kasad/internal/web"
 	"github.com/gureetk/kasad/plug"
 	"github.com/gureetk/kasad/schedule"
 )
@@ -40,12 +41,13 @@ const shutdownTimeout = 5 * time.Second
 type serveOptions struct {
 	dataDir      string
 	syncInterval time.Duration // zero means never set the plug's clock
-	listen       string        // empty means no API
+	listen       string        // empty means no web app or API
 	token        string        // empty means the API asks for no token
 }
 
 // serve runs the schedule in the data directory against the plug, keeps the
-// plug's clock set and, if asked to, serves the API, until ctx ends.
+// plug's clock set and, if asked to, serves the web app and the API, until ctx
+// ends.
 func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment) error {
 	handler := slog.NewTextHandler(env.stderr, nil)
 	logger := slog.New(handler)
@@ -65,13 +67,13 @@ func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment
 		return err
 	}
 
-	// Claim the API's address before anything else starts, so that a bad
-	// address or a port already in use stops serve at once.
+	// Claim the address to listen on before anything else starts, so that a
+	// bad address or a port already in use stops serve at once.
 	var listener net.Listener
 	if opts.listen != "" {
 		listener, err = net.Listen("tcp", opts.listen)
 		if err != nil {
-			return fmt.Errorf("API: %w", err)
+			return fmt.Errorf("-listen: %w", err)
 		}
 	}
 
@@ -93,30 +95,37 @@ func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment
 	var background sync.WaitGroup
 
 	if listener != nil {
+		// The web app's files are open to anyone who can reach the address.
+		// Everything they can do goes through the API, which is where the
+		// token is checked.
+		mux := http.NewServeMux()
+		mux.Handle("/api/", (&api.Server{
+			Plug:   p,
+			Store:  store,
+			Token:  opts.token,
+			Now:    env.now,
+			Logger: logger,
+		}).Handler())
+		mux.Handle("/", web.Handler())
+
 		server := &http.Server{
-			Handler: (&api.Server{
-				Plug:   p,
-				Store:  store,
-				Token:  opts.token,
-				Now:    env.now,
-				Logger: logger,
-			}).Handler(),
+			Handler:           mux,
 			ReadHeaderTimeout: 10 * time.Second,
 			ReadTimeout:       30 * time.Second,
 			WriteTimeout:      30 * time.Second,
 			IdleTimeout:       2 * time.Minute,
 			ErrorLog:          slog.NewLogLogger(handler, slog.LevelWarn),
 		}
-		logger.Info("serving the API", "addr", listener.Addr().String(), "token", opts.token != "")
+		logger.Info("serving the web app and API", "addr", listener.Addr().String(), "token", opts.token != "")
 		if opts.token == "" && !isLoopback(listener.Addr()) {
-			logger.Warn("the API can be reached from other machines and asks for no token; set " + tokenEnv + " to require one")
+			logger.Warn("the web app and API can be reached from other machines and ask for no token; set " + tokenEnv + " to require one")
 		}
 
 		background.Add(2)
 		go func() {
 			defer background.Done()
 			if err := server.Serve(listener); !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("the API stopped unexpectedly", "error", err)
+				logger.Error("the web app and API stopped unexpectedly", "error", err)
 				cancel()
 			}
 		}()

@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>kasad</title>
+<meta name="description" content="Switch and schedule a smart plug on your own network.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#EEF3EE" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111814" media="(prefers-color-scheme: dark)">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="kasad">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="app.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+
+<svg class="sprite" aria-hidden="true" focusable="false">
+<symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3.5v8.5"/><path d="M6.6 6.8a7.8 7.8 0 1 0 10.8 0"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="3"/><path d="M8 3v4"/><path d="M16 3v4"/><path d="M4 10h16"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v4.5h-4.5"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></symbol>
+<symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+<symbol id="i-wifi" viewBox="0 0 24 24"><path d="M4.5 9.5a11 11 0 0 1 15 0"/><path d="M7.5 12.8a7 7 0 0 1 9 0"/><path d="M10.4 16a3 3 0 0 1 3.2 0"/><path d="M12 19.2v.1"/></symbol>
+<symbol id="i-warning" viewBox="0 0 24 24"><path d="M12 4.5l8.5 14.5h-17L12 4.5z"/><path d="M12 10.5v4"/><path d="M12 17v.2"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+</svg>
+
+<noscript><p class="noscript">This page needs JavaScript to talk to kasad.</p></noscript>
+
+<div id="token-screen" class="token" hidden>
+<main class="token__main">
+<div class="brand">
+<span class="brand__mark" aria-hidden="true"><svg class="icon"><use href="#i-power"/></svg></span>
+<span class="brand__name">kasad</span>
+</div>
+<div class="token__intro">
+<h1>Enter your token</h1>
+<p>This kasad only answers requests that carry its token.</p>
+</div>
+<form id="token-form" class="card token__form" novalidate>
+<label for="token-input" class="label">Token</label>
+<div class="field">
+<input id="token-input" class="field__input" type="password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+<button type="button" id="token-reveal" class="field__button" aria-pressed="false" aria-label="Show token"><svg class="icon" aria-hidden="true"><use href="#i-eye"/></svg></button>
+</div>
+<p id="token-error" class="problem" role="alert" hidden></p>
+<button type="submit" id="token-submit" class="button">Connect</button>
+</form>
+<p class="hint">The token is the value of KASAD_TOKEN on the machine that runs kasad. This browser remembers it after you connect.</p>
+</main>
+<p class="token__foot">kasad runs on your own network. Nothing leaves it.</p>
+</div>
+
+<div id="app" class="app" hidden>
+
+<nav class="nav" aria-label="Sections">
+<div class="brand nav__brand">
+<span class="brand__mark" aria-hidden="true"><svg class="icon"><use href="#i-power"/></svg></span>
+<span class="brand__name">kasad</span>
+</div>
+<a href="#plug" class="nav__link" data-view="plug">
+<span class="nav__icon" aria-hidden="true"><svg class="icon"><use href="#i-power"/></svg></span>
+<span class="nav__label">Plug</span>
+</a>
+<a href="#schedule" class="nav__link" data-view="schedule">
+<span class="nav__icon" aria-hidden="true"><svg class="icon"><use href="#i-calendar"/></svg></span>
+<span class="nav__label">Schedule</span>
+</a>
+</nav>
+
+<div class="page">
+
+<main id="view-plug" class="view" hidden>
+<header class="head">
+<div class="head__text">
+<h1 id="plug-name">Plug</h1>
+<p id="plug-status" class="status"><span class="status__dot" aria-hidden="true"></span><span id="plug-status-text">Connecting…</span></p>
+</div>
+<button type="button" id="refresh" class="round" aria-label="Refresh">
+<svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span class="round__label" aria-hidden="true">Refresh</span>
+</button>
+</header>
+
+<section id="alert" class="alert" role="alert" hidden>
+<svg class="icon" aria-hidden="true"><use href="#i-warning"/></svg>
+<div class="alert__text">
+<h2 id="alert-title"></h2>
+<p id="alert-body"></p>
+</div>
+</section>
+
+<div class="columns">
+<div class="column">
+
+<section id="power" class="card power" aria-label="Power">
+<button type="button" id="dial" class="dial" aria-pressed="false" aria-label="Turn on" disabled>
+<span class="dial__face"><svg class="icon" aria-hidden="true"><use href="#i-power"/></svg></span>
+</button>
+<p class="power__text">
+<span id="power-state" class="power__state">&nbsp;</span>
+<span id="power-detail" class="power__detail">&nbsp;</span>
+</p>
+</section>
+
+<section id="details" class="card rows" aria-label="Plug details" hidden>
+<div class="rows__row">
+<svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg>
+<span class="rows__name">Plug clock</span>
+<span id="detail-clock" class="rows__value"></span>
+</div>
+<div class="rows__row">
+<svg class="icon" aria-hidden="true"><use href="#i-wifi"/></svg>
+<span class="rows__name">Wi-Fi signal</span>
+<span id="detail-signal" class="rows__value"></span>
+</div>
+</section>
+
+</div>
+<div class="column">
+
+<section class="card today" aria-labelledby="today-title">
+<div class="today__head">
+<h2 id="today-title" class="eyebrow">Today</h2>
+<a href="#schedule" class="today__link">Schedule<svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg></a>
+</div>
+<div id="today-bar" class="bar" role="img" aria-label="Nothing scheduled today."></div>
+<div class="scale" aria-hidden="true"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div>
+<div class="today__next">
+<span id="next-what" class="today__what">&nbsp;</span>
+<span id="next-when" class="today__when"></span>
+</div>
+</section>
+
+<section class="card rules rules--beside" aria-label="Rules">
+<ul class="rules__list" data-rules></ul>
+</section>
+
+</div>
+</div>
+</main>
+
+<main id="view-schedule" class="view" hidden>
+<header class="head">
+<div class="head__text">
+<h1>Schedule</h1>
+<p id="schedule-summary" class="status">&nbsp;</p>
+</div>
+<button type="button" class="round round--primary" data-add aria-label="Add a rule">
+<svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>
+</button>
+</header>
+
+<div class="columns">
+<div class="column">
+
+<section class="card week" aria-labelledby="week-title">
+<h2 id="week-title" class="eyebrow">This week</h2>
+<div class="scale scale--week" aria-hidden="true"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div>
+<div id="week-rows" class="week__rows"></div>
+</section>
+
+</div>
+<div class="column">
+
+<section class="card rules" aria-label="Rules">
+<ul class="rules__list" data-rules></ul>
+</section>
+
+<p class="hint">Rules run on kasad, by its own clock. They need neither the internet nor the plug's clock.</p>
+
+</div>
+</div>
+</main>
+
+</div>
+</div>
+
+<dialog id="editor" class="sheet" aria-labelledby="editor-title">
+<form id="editor-form" class="sheet__form" novalidate>
+<span class="sheet__grabber" aria-hidden="true"></span>
+<header class="sheet__head">
+<button type="button" id="editor-cancel" class="plain">Cancel</button>
+<h2 id="editor-title">Edit rule</h2>
+<button type="submit" id="editor-save" class="plain plain--strong">Save</button>
+</header>
+
+<div class="sheet__body">
+
+<div class="group">
+<div class="group__row group__row--tall">
+<span id="action-label">Action</span>
+<div class="segments" role="radiogroup" aria-labelledby="action-label">
+<label class="segments__option"><input type="radio" name="action" value="on"><span class="segments__face"><span class="segments__dot" aria-hidden="true"></span>On</span></label>
+<label class="segments__option"><input type="radio" name="action" value="off"><span class="segments__face">Off</span></label>
+</div>
+</div>
+<div class="group__row">
+<label for="rule-time">Time</label>
+<input id="rule-time" class="group__input group__input--time" type="time" required>
+</div>
+</div>
+
+<div class="block">
+<h3 id="repeat-label" class="eyebrow">Repeat</h3>
+<div class="group">
+<div class="days" role="group" aria-labelledby="repeat-label">
+<button type="button" class="days__day" data-day="mon" aria-pressed="false" aria-label="Monday">M</button>
+<button type="button" class="days__day" data-day="tue" aria-pressed="false" aria-label="Tuesday">T</button>
+<button type="button" class="days__day" data-day="wed" aria-pressed="false" aria-label="Wednesday">W</button>
+<button type="button" class="days__day" data-day="thu" aria-pressed="false" aria-label="Thursday">T</button>
+<button type="button" class="days__day" data-day="fri" aria-pressed="false" aria-label="Friday">F</button>
+<button type="button" class="days__day" data-day="sat" aria-pressed="false" aria-label="Saturday">S</button>
+<button type="button" class="days__day" data-day="sun" aria-pressed="false" aria-label="Sunday">S</button>
+</div>
+<div class="presets">
+<button type="button" class="presets__preset" data-preset="all" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg>Every day</button>
+<button type="button" class="presets__preset" data-preset="weekdays" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg>Weekdays</button>
+<button type="button" class="presets__preset" data-preset="weekends" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg>Weekends</button>
+</div>
+</div>
+</div>
+
+<div class="group">
+<div class="group__row">
+<label for="rule-name">Name</label>
+<input id="rule-name" class="group__input" type="text" maxlength="40" placeholder="Optional" autocomplete="off">
+</div>
+<div class="group__row">
+<span id="rule-active-label">Active</span>
+<button type="button" id="rule-active" class="switch" role="switch" aria-checked="true" aria-labelledby="rule-active-label"><span class="switch__track" aria-hidden="true"><span class="switch__knob"></span></span></button>
+</div>
+</div>
+
+<p id="rule-summary" class="hint hint--tight"></p>
+<p id="editor-error" class="problem" role="alert" hidden></p>
+
+<div id="rule-delete-group" class="group">
+<button type="button" id="rule-delete" class="group__action group__action--danger">Delete rule</button>
+</div>
+
+</div>
+</form>
+</dialog>
+
+<p id="toast" class="toast" role="status" aria-live="polite" hidden></p>
+
+</body>
+</html>

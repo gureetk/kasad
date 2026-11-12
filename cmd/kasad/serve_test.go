@@ -376,13 +376,13 @@ func TestStateFileIsReadableJSON(t *testing.T) {
 	}
 }
 
-var apiAddrPattern = regexp.MustCompile(`msg="serving the API" addr=(\S+)`)
+var apiAddrPattern = regexp.MustCompile(`msg="serving the web app and API" addr=(\S+)`)
 
 // apiURL waits for serve to say where its API is and returns the URL of path
 // there.
 func (s *serving) apiURL(path string) string {
 	s.t.Helper()
-	s.waitForLog("serving the API")
+	s.waitForLog("serving the web app and API")
 	match := apiAddrPattern.FindStringSubmatch(s.stderr.String())
 	if match == nil {
 		s.t.Fatalf("could not find the API address in the log:\n%s", s.stderr.String())
@@ -422,7 +422,7 @@ func TestServeOffersNoAPIUnlessAsked(t *testing.T) {
 	s.waitForLog("starting")
 	s.settle()
 	s.stop()
-	if strings.Contains(s.stderr.String(), "serving the API") {
+	if strings.Contains(s.stderr.String(), "serving the web app and API") {
 		t.Errorf("serve started the API without -listen:\n%s", s.stderr.String())
 	}
 }
@@ -448,7 +448,7 @@ func TestServeAPI(t *testing.T) {
 		t.Errorf("exit code = %d, want %d. Log:\n%s", code, exitOK, s.stderr.String())
 	}
 	// Loopback only, so no warning about an open API.
-	if strings.Contains(s.stderr.String(), "asks for no token") {
+	if strings.Contains(s.stderr.String(), "ask for no token") {
 		t.Errorf("serve warned about an API that only this machine can reach:\n%s", s.stderr.String())
 	}
 }
@@ -500,20 +500,43 @@ func TestServeAPIToken(t *testing.T) {
 	}
 }
 
+func TestServeWebApp(t *testing.T) {
+	mock := startMock(t)
+	vars := map[string]string{tokenEnv: "s3cret"}
+	s := startServeWithEnv(t, mock, t.TempDir(), vars, "-sync-interval", "0", "-listen", "127.0.0.1:0")
+
+	// The page is served without the token, since a browser cannot send one
+	// when it first asks. The page can do nothing until it is given one.
+	code, body := s.request("GET", "/", "", nil)
+	if code != http.StatusOK || !strings.Contains(body, "<title>kasad</title>") {
+		t.Errorf("GET / = %d:\n%s", code, body)
+	}
+	if code, body := s.request("GET", "/app.js", "", nil); code != http.StatusOK {
+		t.Errorf("GET /app.js = %d:\n%s", code, body)
+	}
+	if code, body := s.request("GET", "/api/status", "", nil); code != http.StatusUnauthorized {
+		t.Errorf("GET /api/status without the token = %d:\n%s", code, body)
+	}
+	if code, body := s.request("GET", "/no-such-page", "", nil); code != http.StatusNotFound {
+		t.Errorf("GET /no-such-page = %d:\n%s", code, body)
+	}
+	s.stop()
+}
+
 func TestServeWarnsAboutAnOpenAPI(t *testing.T) {
 	mock := startMock(t)
 
 	open := startServe(t, mock, t.TempDir(), "-sync-interval", "0", "-listen", "0.0.0.0:0")
-	open.waitForLog("serving the API")
-	open.waitForLog("asks for no token")
+	open.waitForLog("serving the web app and API")
+	open.waitForLog("ask for no token")
 	open.stop()
 
 	vars := map[string]string{tokenEnv: "s3cret"}
 	guarded := startServeWithEnv(t, mock, t.TempDir(), vars, "-sync-interval", "0", "-listen", "0.0.0.0:0")
-	guarded.waitForLog("serving the API")
+	guarded.waitForLog("serving the web app and API")
 	guarded.settle()
 	guarded.stop()
-	if strings.Contains(guarded.stderr.String(), "asks for no token") {
+	if strings.Contains(guarded.stderr.String(), "ask for no token") {
 		t.Errorf("serve warned about an API that has a token:\n%s", guarded.stderr.String())
 	}
 }
@@ -527,7 +550,7 @@ func TestServeFailsWhenTheAPIAddressIsTaken(t *testing.T) {
 	defer taken.Close()
 
 	got := kasad(t, nil, "-host", mock.Addr(), "-data", t.TempDir(), "-listen", taken.Addr().String(), "serve")
-	if got.code != exitFailed || !strings.Contains(got.stderr, "API:") {
+	if got.code != exitFailed || !strings.Contains(got.stderr, "-listen:") {
 		t.Errorf("exit code = %d, stderr = %q", got.code, got.stderr)
 	}
 	if mock.Requests() != 0 {

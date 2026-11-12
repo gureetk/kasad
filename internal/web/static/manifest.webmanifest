@@ -1,0 +1,15 @@
+{
+  "name": "kasad",
+  "short_name": "kasad",
+  "description": "Switch and schedule a smart plug on your own network.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#EEF3EE",
+  "theme_color": "#EEF3EE",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
