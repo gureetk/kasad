@@ -1,0 +1,40 @@
+# Binaries
+/kasad
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries, built with `go test -c`
+*.test
+
+# Coverage and profiling output
+*.out
+coverage.*
+*.coverprofile
+*.prof
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Dependency directory, if vendoring is ever used locally
+# vendor/
+
+# Local environment and configuration
+.env
+.env.*
+!.env.example
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
