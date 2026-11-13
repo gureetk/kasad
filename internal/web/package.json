@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Marks the web app's scripts as modules so that Node can run their tests. There is nothing to install.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

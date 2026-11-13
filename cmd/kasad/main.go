@@ -28,8 +28,9 @@ Commands:
 The plug keeps local time with no UTC offset. state, sync and serve assume
 that the plug is set to the same timezone as this machine.
 
-serve can also offer a JSON API, at the address given with -listen. If the
-environment variable KASAD_TOKEN is set, API requests must carry that token.
+serve can also offer a web app and a JSON API, at the address given with
+-listen. If the environment variable KASAD_TOKEN is set, API requests must
+carry that token, and the web app asks for it.
 
 Flags:
 `
@@ -77,7 +78,7 @@ func run(ctx context.Context, args []string, env environment) int {
 	timeout := flags.Duration("timeout", protocol.DefaultTimeout, "how long to wait for the plug to answer")
 	dataDir := flags.String("data", ".", "serve: directory holding "+scheduleFile+", and where progress is saved")
 	syncInterval := flags.Duration("sync-interval", time.Hour, "serve: how often to set the plug's clock (0 to never set it)")
-	listen := flags.String("listen", "", "serve: address to offer the JSON API on, such as 127.0.0.1:8080 (default: no API)")
+	listen := flags.String("listen", "", "serve: address to offer the web app and JSON API on, such as 127.0.0.1:8080 (default: neither)")
 	flags.Usage = func() {
 		fmt.Fprint(env.stderr, usage)
 		flags.PrintDefaults()

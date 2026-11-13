@@ -12,9 +12,8 @@ Early. What works today:
 - switch the relay on and off
 - set the plug's clock from the machine kasad runs on
 - run a weekly on/off schedule, as a long-running service
+- offer a web app for switching the plug and editing the schedule
 - offer a JSON API for the plug and the schedule
-
-Planned: a small web interface served by the same binary.
 
 ## Build
 
@@ -128,13 +127,38 @@ it off. Without `serve`, the `sync` command does the same job from cron:
 The plug keeps local time with no UTC offset. `state`, `sync` and `serve`
 assume the plug is set to the same timezone as the machine running kasad.
 
-## JSON API
+## Web app
 
-`serve` offers an HTTP API when given an address to listen on:
+`serve` offers a web app when given an address to listen on:
 
 ```
 kasad -host 192.0.2.10 -data /var/lib/kasad -listen 127.0.0.1:8080 serve
 ```
+
+Open `http://127.0.0.1:8080/` in a browser. The page shows whether the plug
+is on and switches it, shows when the schedule will next act, and adds, edits,
+pauses and deletes rules. It lays itself out for a phone or a desktop, and
+follows the device's light or dark setting.
+
+Things to know:
+
+- **It is part of the binary.** The page is a few static files compiled into
+  kasad. It loads nothing from anywhere else, so it works on a network with no
+  internet. It does need kasad: there is nothing for it to show offline.
+- **Times are kasad's.** Rules run by the clock of the machine kasad is on,
+  and the page shows those times as they are, whatever timezone the browser
+  is in.
+- **It asks the plug often.** While the page is open and on screen it
+  refreshes every 10 seconds, and each refresh asks the plug for its state.
+- **Installing it.** The page has what a browser needs to install it as an
+  app. Browsers generally only offer that for pages served over HTTPS or from
+  `localhost`, so over plain HTTP on a LAN it is an ordinary page that can be
+  bookmarked. To install it, put kasad behind something that adds TLS.
+
+## JSON API
+
+The web app works through a JSON API at the same address, which other
+programs can use too:
 
 | Request | What it does |
 |---|---|
@@ -157,22 +181,27 @@ does not depend on the plug.
 
 Requests that change something must be sent as `application/json`.
 
-### Who can use the API
+### Who can use the web app and API
 
-Without `-listen` there is no API. With it, anyone who can reach the address
+Without `-listen` there is neither. With it, anyone who can reach the address
 can switch the plug and change the schedule, so choose the address with care:
-`127.0.0.1` keeps the API to the machine itself.
+`127.0.0.1` keeps them to the machine itself.
 
 To require a token, set `KASAD_TOKEN` in the environment of `serve`. Every
-request must then carry it:
+API request must then carry it:
 
 ```
 curl -H 'Authorization: Bearer the-token' http://192.0.2.20:8080/api/status
 ```
 
-Set a token whenever the API listens on an address other machines can reach.
-`serve` logs a warning if it does not have one. The API is plain HTTP, so on
-a network you do not trust, put it behind something that adds TLS.
+The web app's own files are still served to anyone, since a browser has no
+token to send when it first asks, and they hold nothing secret. The page then
+asks for the token before it can show or do anything, and keeps it in that
+browser's storage so that it is only asked for once.
+
+Set a token whenever kasad listens on an address other machines can reach.
+`serve` logs a warning if it does not have one. Everything is plain HTTP, so
+on a network you do not trust, put it behind something that adds TLS.
 
 ## Layout
 
@@ -182,6 +211,8 @@ a network you do not trust, put it behind something that adds TLS.
 - `schedule`: rules, the calculation of when they fall due, the loop that
   applies them, and the file-backed store they are kept in.
 - `internal/api`: the JSON API.
+- `internal/web`: the web app. `static` holds the page as it is served, with
+  no build step: plain HTML, CSS and JavaScript modules.
 - `cmd/kasad`: the command-line tool.
 - `internal/mockplug`: an in-memory mock plug, so the tests run without
   hardware.
@@ -196,4 +227,12 @@ can reach.
 
 ```
 go test -race ./...
+```
+
+The web app's schedule and time arithmetic has tests of its own, which need
+Node.js 20 or newer and nothing else. Building and running kasad does not
+need Node.js.
+
+```
+cd internal/web && node --test
 ```

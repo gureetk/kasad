@@ -18,7 +18,8 @@ After=network-online.target
 Environment=KASAD_HOST=192.0.2.10
 ExecStart=/usr/local/bin/kasad -data /var/lib/kasad serve
 
-# To offer the JSON API as well, add -listen to the line above, for example
+# To offer the web app and JSON API as well, add -listen to the line above,
+# for example
 #   ExecStart=/usr/local/bin/kasad -data /var/lib/kasad -listen 127.0.0.1:8080 serve
 # and, if it listens beyond this machine, set a token in a file that only
 # root can read, containing the line KASAD_TOKEN=...:
