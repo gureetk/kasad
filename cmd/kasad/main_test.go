@@ -181,6 +181,9 @@ func TestUsageErrors(t *testing.T) {
 		{"no command", []string{"-host", mock.Addr()}, "no command given"},
 		{"unknown command", []string{"-host", mock.Addr(), "toggle"}, `unknown command "toggle"`},
 		{"too many commands", []string{"-host", mock.Addr(), "on", "off"}, "expected one command"},
+		{"rules with an argument", []string{"-host", mock.Addr(), "rules", "all"}, "expected one command"},
+		{"delete-rule with no id", []string{"-host", mock.Addr(), "delete-rule"}, "delete-rule takes the id of one rule"},
+		{"delete-rule with two ids", []string{"-host", mock.Addr(), "delete-rule", "a", "b"}, "delete-rule takes the id of one rule"},
 		{"no host", []string{"state"}, "no plug address"},
 		{"unknown flag", []string{"-colour", "state"}, "flag provided but not defined"},
 		{"zero timeout", []string{"-host", mock.Addr(), "-timeout", "0s", "state"}, "-timeout must be positive"},
@@ -288,5 +291,102 @@ func TestSyncRoundsToTheNearestSecond(t *testing.T) {
 	}
 	if want := testNow.Add(time.Second); !mock.Time().Equal(want) {
 		t.Errorf("plug clock after sync = %v, want %v", mock.Time(), want)
+	}
+}
+
+// Three made-up rules on the plug: on at 07:30 on weekdays; off at sunset at
+// weekends, switched off; and an unnamed one that runs once, on at 21:05 and
+// off again.
+var plugRules = []mockplug.Rule{
+	{
+		ID: "00000000000000000000000000000001", Name: "morning", Enable: 1, Repeat: 1,
+		Weekdays: [7]int{0, 1, 1, 1, 1, 1, 0}, StartOption: 0, StartMinute: 450, StartAction: 1, EndAction: -1,
+	},
+	{
+		ID: "00000000000000000000000000000002", Name: "dusk", Enable: 0, Repeat: 1,
+		Weekdays: [7]int{1, 0, 0, 0, 0, 0, 1}, StartOption: 2, StartMinute: 0, StartAction: 0, EndAction: -1,
+	},
+	{
+		ID: "00000000000000000000000000000003", Enable: 1, Repeat: 0,
+		Weekdays: [7]int{1, 1, 1, 1, 1, 1, 1}, StartOption: 0, StartMinute: 1265, StartAction: 1, EndAction: 0,
+	},
+}
+
+func TestRules(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(plugRules...)
+
+	got := kasad(t, nil, "-host", mock.Addr(), "rules")
+	if got.code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", got.code, got.stderr)
+	}
+	want := `ID                                WHEN    DOES          DAYS                 NAME
+00000000000000000000000000000001  07:30   on            Mon Tue Wed Thu Fri  morning
+00000000000000000000000000000002  sunset  off           Sat Sun              dusk (switched off)
+00000000000000000000000000000003  21:05   on, then off  once (every day)     -
+`
+	if got.stdout != want {
+		t.Errorf("stdout:\n%s\nwant:\n%s", got.stdout, want)
+	}
+	if mock.Requests() != 1 {
+		t.Errorf("rules sent %d requests, want 1", mock.Requests())
+	}
+}
+
+func TestRulesWhenThePlugHasNone(t *testing.T) {
+	mock := startMock(t)
+	got := kasad(t, nil, "-host", mock.Addr(), "rules")
+	if got.code != exitOK || got.stdout != "The plug has no rules of its own.\n" {
+		t.Errorf("exit code %d, stdout %q, stderr %q", got.code, got.stdout, got.stderr)
+	}
+}
+
+func TestRulesSaysWhenTheWholeScheduleIsOff(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(plugRules[0])
+	mock.SetScheduleEnabled(false)
+
+	got := kasad(t, nil, "-host", mock.Addr(), "rules")
+	if got.code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", got.code, got.stderr)
+	}
+	if !strings.Contains(got.stdout, "morning") || !strings.Contains(got.stdout, "switched off, so none of these run") {
+		t.Errorf("stdout does not list the rule and say that the schedule is off:\n%s", got.stdout)
+	}
+}
+
+func TestDeleteRule(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(plugRules...)
+
+	got := kasad(t, nil, "-host", mock.Addr(), "delete-rule", "00000000000000000000000000000002")
+	if got.code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", got.code, got.stderr)
+	}
+	if got.stdout != "Deleted rule 00000000000000000000000000000002 from the plug\n" {
+		t.Errorf("stdout = %q", got.stdout)
+	}
+	left := mock.Rules()
+	if len(left) != 2 || left[0].ID != plugRules[0].ID || left[1].ID != plugRules[2].ID {
+		t.Errorf("rules left on the plug: %+v, want the first and third", left)
+	}
+}
+
+func TestDeleteRuleThatIsNotThere(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(plugRules...)
+
+	got := kasad(t, nil, "-host", mock.Addr(), "delete-rule", "morning")
+	if got.code != exitFailed {
+		t.Errorf("exit code = %d, want %d", got.code, exitFailed)
+	}
+	if !strings.Contains(got.stderr, `no rule with the id "morning"`) {
+		t.Errorf("stderr does not say there is no such rule:\n%s", got.stderr)
+	}
+	if got.stdout != "" {
+		t.Errorf("unexpected stdout: %s", got.stdout)
+	}
+	if left := mock.Rules(); len(left) != len(plugRules) {
+		t.Errorf("%d rules left on the plug, want all %d", len(left), len(plugRules))
 	}
 }

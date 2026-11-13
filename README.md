@@ -12,6 +12,7 @@ Early. What works today:
 - switch the relay on and off
 - set the plug's clock from the machine kasad runs on
 - run a weekly on/off schedule, as a long-running service
+- list and delete the rules stored on the plug itself
 - offer a web app for switching the plug and editing the schedule
 - offer a JSON API for the plug and the schedule
 
@@ -109,6 +110,42 @@ How `serve` behaves:
 
 `contrib/kasad.service` is a sample systemd unit.
 
+## Rules stored on the plug
+
+A plug also keeps a schedule of its own, which is where rules made with the
+vendor's app end up. The plug runs those rules by itself, by its own clock,
+whether or not kasad is running. They are separate from the schedule that
+`serve` runs: kasad does not run them, and `serve` does not stop them. If
+both hold rules, both act on the plug.
+
+```
+kasad -host 192.0.2.10 rules
+```
+
+```
+ID                                WHEN    DOES  DAYS                 NAME
+00000000000000000000000000000001  07:30   on    Mon Tue Wed Thu Fri  morning
+00000000000000000000000000000002  sunset  off   Sat Sun              dusk (switched off)
+```
+
+To remove one, give its id:
+
+```
+kasad -host 192.0.2.10 delete-rule 00000000000000000000000000000001
+```
+
+A deleted rule cannot be brought back. kasad asks the plug what rules it has
+first, and only ever asks it to delete one of those.
+
+kasad can list and delete these rules, but not yet add or change them. Two
+things are worth knowing:
+
+- Deleting has so far only been tried against the mock plug that the tests
+  use, not against hardware.
+- The plug gives a rule's days as seven flags. kasad reads them as starting
+  on Sunday, which is how other clients for these plugs read them, but that
+  has not been checked against a plug holding a rule for only some days.
+
 ### The plug's clock
 
 These plugs are reported to lose their clock when they lose power, and they
@@ -164,22 +201,60 @@ programs can use too:
 |---|---|
 | `GET /api/status` | The plug's state and clock, and the next scheduled event |
 | `POST /api/relay` | Switch the plug: send `{"on": true}` or `{"on": false}` |
-| `GET /api/schedule` | The schedule, in the same form as `schedule.json` |
-| `PUT /api/schedule` | Replace the whole schedule |
+| `GET /api/schedule` | The schedule kasad runs, in the same form as `schedule.json` |
+| `PUT /api/schedule` | Replace the whole schedule kasad runs |
+| `GET /api/plug/rules` | The rules stored on the plug, which it runs by itself |
+| `DELETE /api/plug/rules/{id}` | Delete one of the rules stored on the plug |
 
 ```
 curl http://127.0.0.1:8080/api/status
 curl -X POST -H 'Content-Type: application/json' -d '{"on": true}' http://127.0.0.1:8080/api/relay
 curl -X PUT -H 'Content-Type: application/json' --data @schedule.json http://127.0.0.1:8080/api/schedule
+curl http://127.0.0.1:8080/api/plug/rules
+curl -X DELETE http://127.0.0.1:8080/api/plug/rules/00000000000000000000000000000001
 ```
 
 Responses are JSON. An error has the form `{"error": "..."}` with a fitting
-status code: 400 for a request that is wrong, 502 when the plug could not be
-reached or did not switch. `GET /api/status` still answers 200 when the plug
-is unreachable, with `"reachable": false`, because the rest of the answer
-does not depend on the plug.
+status code: 400 for a request that is wrong, 404 for a rule the plug does
+not have, 502 when the plug could not be reached or did not do as asked.
+`GET /api/status` still answers 200 when the plug is unreachable, with
+`"reachable": false`, because the rest of the answer does not depend on the
+plug.
 
-Requests that change something must be sent as `application/json`.
+A `POST` or `PUT` must be sent as `application/json`.
+
+`GET /api/plug/rules` answers with the plug's own schedule:
+
+```json
+{
+  "enabled": true,
+  "rules": [
+    {
+      "id": "00000000000000000000000000000001",
+      "name": "morning",
+      "enabled": true,
+      "weekly": true,
+      "repeats": true,
+      "days": ["mon", "tue", "wed", "thu", "fri"],
+      "at": "time",
+      "time": "07:30",
+      "action": "on"
+    }
+  ]
+}
+```
+
+- `enabled` at the top says whether the plug's schedule as a whole is switched
+  on. Each rule has its own `enabled` as well.
+- `at` is `time`, `sunrise`, `sunset` or `unknown`. `time` is only present for
+  a rule timed by the clock, and is by the plug's clock.
+- `action` is `on`, `off` or `unknown`.
+- `repeats` is false for a rule that runs once.
+- `end` appears on a rule that does a second thing later, with its own `at`,
+  `time` and `action`.
+- `weekly` is true for the plain kind of rule, which switches the plug at a
+  time of day on chosen days of every week and does nothing else. That is the
+  kind the schedule kasad runs is made of.
 
 ### Who can use the web app and API
 
@@ -207,7 +282,8 @@ on a network you do not trust, put it behind something that adds TLS.
 
 - `protocol`: the wire protocol, which is JSON obfuscated with an autokey XOR
   cipher and sent with a 4-byte length prefix.
-- `plug`: typed commands built on `protocol`.
+- `plug`: typed commands built on `protocol`, including reading and deleting
+  the rules a plug stores.
 - `schedule`: rules, the calculation of when they fall due, the loop that
   applies them, and the file-backed store they are kept in.
 - `internal/api`: the JSON API.

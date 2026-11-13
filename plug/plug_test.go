@@ -370,3 +370,159 @@ func TestSwitchNoticesARelayThatDoesNotMove(t *testing.T) {
 		t.Errorf("a relay that did not move was reported as a device error: %v", err)
 	}
 }
+
+// Three made-up rules: on at 07:30 on weekdays; off at sunset at weekends,
+// switched off; and one that runs once, on at 21:05 and off again at 22:00.
+var testRules = []mockplug.Rule{
+	{
+		ID: "00000000000000000000000000000001", Name: "morning", Enable: 1, Repeat: 1,
+		Weekdays: [7]int{0, 1, 1, 1, 1, 1, 0}, StartOption: 0, StartMinute: 450, StartAction: 1, EndAction: -1,
+	},
+	{
+		ID: "00000000000000000000000000000002", Name: "dusk", Enable: 0, Repeat: 1,
+		Weekdays: [7]int{1, 0, 0, 0, 0, 0, 1}, StartOption: 2, StartMinute: 0, StartAction: 0, EndAction: -1,
+	},
+	{
+		ID: "00000000000000000000000000000003", Name: "", Enable: 1, Repeat: 0,
+		Weekdays: [7]int{0, 0, 0, 1, 0, 0, 0}, StartOption: 0, StartMinute: 1265, StartAction: 1, EndAction: 0,
+	},
+}
+
+func TestRules(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(testRules...)
+
+	rules, err := New(mock.Addr()).Rules(context.Background())
+	if err != nil {
+		t.Fatalf("Rules: %v", err)
+	}
+	if !rules.Enabled {
+		t.Error("the schedule as a whole is reported as off")
+	}
+
+	want := []Rule{
+		{
+			ID: "00000000000000000000000000000001", Name: "morning", Enabled: true, Repeat: true,
+			Days: [7]bool{time.Monday: true, time.Tuesday: true, time.Wednesday: true, time.Thursday: true, time.Friday: true},
+			Time: AtClockTime, Minute: 450, Action: RuleOn,
+			EndAction: RuleNone, EndTime: NoTime,
+		},
+		{
+			ID: "00000000000000000000000000000002", Name: "dusk", Enabled: false, Repeat: true,
+			Days: [7]bool{time.Sunday: true, time.Saturday: true},
+			Time: AtSunset, Action: RuleOff,
+			EndAction: RuleNone, EndTime: NoTime,
+		},
+		{
+			ID: "00000000000000000000000000000003", Enabled: true, Repeat: false,
+			Days: [7]bool{time.Wednesday: true},
+			Time: AtClockTime, Minute: 1265, Action: RuleOn,
+			EndAction: RuleOff, EndTime: NoTime,
+		},
+	}
+	if len(rules.List) != len(want) {
+		t.Fatalf("got %d rules, want %d: %+v", len(rules.List), len(want), rules.List)
+	}
+	for i := range want {
+		if rules.List[i] != want[i] {
+			t.Errorf("rule %d:\n got %+v\nwant %+v", i, rules.List[i], want[i])
+		}
+	}
+}
+
+func TestRulesWhenThereAreNone(t *testing.T) {
+	mock := startMock(t)
+	mock.SetScheduleEnabled(false)
+
+	rules, err := New(mock.Addr()).Rules(context.Background())
+	if err != nil {
+		t.Fatalf("Rules: %v", err)
+	}
+	if rules.Enabled || len(rules.List) != 0 {
+		t.Errorf("got %+v, want a schedule that is off and empty", rules)
+	}
+}
+
+func TestRuleWeekly(t *testing.T) {
+	weekly := Rule{
+		Enabled: true, Repeat: true, Days: [7]bool{time.Monday: true},
+		Time: AtClockTime, Minute: 450, Action: RuleOn, EndAction: RuleNone, EndTime: NoTime,
+	}
+	if !weekly.Weekly() {
+		t.Errorf("a plain weekly rule is not reported as one: %+v", weekly)
+	}
+	// Being switched off does not change what kind of rule it is.
+	paused := weekly
+	paused.Enabled = false
+	if !paused.Weekly() {
+		t.Error("a weekly rule that is switched off is not reported as weekly")
+	}
+
+	for name, change := range map[string]func(*Rule){
+		"runs once":           func(r *Rule) { r.Repeat = false },
+		"no days":             func(r *Rule) { r.Days = [7]bool{} },
+		"at sunrise":          func(r *Rule) { r.Time = AtSunrise },
+		"no time":             func(r *Rule) { r.Time = NoTime },
+		"minute out of range": func(r *Rule) { r.Minute = 1440 },
+		"negative minute":     func(r *Rule) { r.Minute = -1 },
+		"no action":           func(r *Rule) { r.Action = RuleNone },
+		"an action not known": func(r *Rule) { r.Action = 2 },
+		"a second action too": func(r *Rule) { r.EndAction = RuleOff },
+	} {
+		rule := weekly
+		change(&rule)
+		if rule.Weekly() {
+			t.Errorf("%s: reported as a plain weekly rule: %+v", name, rule)
+		}
+	}
+}
+
+func TestDeleteRule(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(testRules...)
+
+	err := New(mock.Addr()).DeleteRule(context.Background(), "00000000000000000000000000000002")
+	if err != nil {
+		t.Fatalf("DeleteRule: %v", err)
+	}
+	left := mock.Rules()
+	if len(left) != 2 || left[0].ID != testRules[0].ID || left[1].ID != testRules[2].ID {
+		t.Errorf("rules left on the plug: %+v, want the first and third", left)
+	}
+}
+
+func TestDeleteRuleThatIsNotThere(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(testRules...)
+
+	for _, id := range []string{"no-such-rule", ""} {
+		before := mock.Requests()
+		err := New(mock.Addr()).DeleteRule(context.Background(), id)
+		if !errors.Is(err, ErrNoSuchRule) {
+			t.Errorf("DeleteRule(%q) = %v, want ErrNoSuchRule", id, err)
+		}
+		// The plug is asked what it has, and nothing more.
+		if sent := mock.Requests() - before; sent != 1 {
+			t.Errorf("DeleteRule(%q) sent %d requests, want 1", id, sent)
+		}
+	}
+	if left := mock.Rules(); len(left) != len(testRules) {
+		t.Errorf("%d rules left on the plug, want all %d", len(left), len(testRules))
+	}
+}
+
+func TestRulesOnAnUnreachablePlug(t *testing.T) {
+	mock := startMock(t)
+	addr := mock.Addr()
+	mock.Close()
+
+	p := New(addr)
+	p.Client.Timeout = time.Second
+	if _, err := p.Rules(context.Background()); err == nil {
+		t.Error("Rules succeeded against a plug that is not there")
+	}
+	var deviceError *Error
+	if err := p.DeleteRule(context.Background(), "anything"); err == nil || errors.As(err, &deviceError) || errors.Is(err, ErrNoSuchRule) {
+		t.Errorf("DeleteRule against a plug that is not there = %v, want a network error", err)
+	}
+}

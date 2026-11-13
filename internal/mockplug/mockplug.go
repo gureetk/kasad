@@ -3,11 +3,16 @@
 //
 // It listens on a loopback port and speaks the same wire protocol as a real
 // device, but understands only a small set of commands: system.get_sysinfo,
-// system.set_relay_state, time.get_time, time.get_timezone and time.set_time.
+// system.set_relay_state, time.get_time, time.get_timezone, time.set_time,
+// schedule.get_rules and schedule.delete_rule.
 //
 // The field names in its replies, and the reply to an unknown method, follow
-// what real hardware sends. Every value is a placeholder, and the reply to an
-// unknown module is an approximation.
+// what real hardware sends. Every value is a placeholder. The replies to an
+// unknown module and to deleting a rule that does not exist are
+// approximations.
+//
+// The mock stores the rules of its schedule but does not run them: its relay
+// only moves when it is told to.
 package mockplug
 
 import (
@@ -39,6 +44,8 @@ type Plug struct {
 	now         func() time.Time
 	clockOffset time.Duration
 	zoneIndex   int
+	rules       []Rule
+	scheduleOff bool
 	requests    int
 	closed      bool
 	conns       map[net.Conn]struct{}
@@ -119,6 +126,54 @@ func (p *Plug) SetTimezoneIndex(index int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.zoneIndex = index
+}
+
+// Rule is a rule in the plug's own schedule, in the terms the device uses on
+// the wire.
+type Rule struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+
+	// Enable is 1 when the rule is switched on and 0 when it is not.
+	Enable int `json:"enable"`
+
+	// Repeat is 1 for a rule that runs every week.
+	Repeat int `json:"repeat"`
+
+	// Weekdays has a 1 for each day the rule runs on, Sunday first.
+	Weekdays [7]int `json:"wday"`
+
+	// StartOption is 0 for a time of day, 1 for sunrise and 2 for sunset.
+	// StartMinute is the time of day in minutes after midnight.
+	StartOption int `json:"stime_opt"`
+	StartMinute int `json:"smin"`
+
+	// StartAction is 1 to switch on and 0 to switch off. EndAction is -1
+	// for a rule with no second action.
+	StartAction int `json:"sact"`
+	EndAction   int `json:"eact"`
+}
+
+// SetRules replaces the rules in the plug's schedule.
+func (p *Plug) SetRules(rules ...Rule) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rules = append([]Rule(nil), rules...)
+}
+
+// Rules returns the rules in the plug's schedule.
+func (p *Plug) Rules() []Rule {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]Rule(nil), p.rules...)
+}
+
+// SetScheduleEnabled sets whether the plug reports its schedule as a whole
+// as switched on. It starts switched on.
+func (p *Plug) SetScheduleEnabled(enabled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.scheduleOff = !enabled
 }
 
 // Requests returns how many requests the plug has answered.
@@ -227,6 +282,8 @@ func (p *Plug) respond(request []byte) ([]byte, bool) {
 			run = p.systemLocked
 		case "time":
 			run = p.timeLocked
+		case "schedule":
+			run = p.scheduleLocked
 		default:
 			reply[module] = status{Code: errModuleNotSupported, Message: "module not support"}
 			continue
@@ -251,7 +308,10 @@ type status struct {
 	Message string `json:"err_msg,omitempty"`
 }
 
-var methodNotSupported = status{Code: errMethodNotSupported, Message: "member not support"}
+var (
+	methodNotSupported = status{Code: errMethodNotSupported, Message: "member not support"}
+	invalidArgument    = status{Code: errInvalidArgument, Message: "invalid argument"}
+)
 
 // systemLocked runs one method of the "system" module. The caller holds
 // p.mu.
@@ -265,7 +325,7 @@ func (p *Plug) systemLocked(method string, args json.RawMessage) any {
 		}
 		if err := json.Unmarshal(args, &params); err != nil || params.State == nil ||
 			(*params.State != 0 && *params.State != 1) {
-			return status{Code: errInvalidArgument, Message: "invalid argument"}
+			return invalidArgument
 		}
 		if !p.stuck {
 			p.setRelayLocked(*params.State == 1)
@@ -300,7 +360,7 @@ func (p *Plug) timeLocked(method string, args json.RawMessage) any {
 			Minute *int `json:"min"`
 			Second *int `json:"sec"`
 		}
-		invalid := status{Code: errInvalidArgument, Message: "invalid argument"}
+		invalid := invalidArgument
 		if err := json.Unmarshal(args, &params); err != nil {
 			return invalid
 		}
@@ -324,6 +384,48 @@ func (p *Plug) timeLocked(method string, args json.RawMessage) any {
 	default:
 		return methodNotSupported
 	}
+}
+
+// scheduleLocked runs one method of the "schedule" module. The caller holds
+// p.mu.
+func (p *Plug) scheduleLocked(method string, args json.RawMessage) any {
+	switch method {
+	case "get_rules":
+		enable := 1
+		if p.scheduleOff {
+			enable = 0
+		}
+		return rulesReply{
+			Rules:   append([]Rule{}, p.rules...),
+			Version: 2,
+			Enable:  enable,
+		}
+	case "delete_rule":
+		var params struct {
+			ID *string `json:"id"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil || params.ID == nil {
+			return invalidArgument
+		}
+		for i, rule := range p.rules {
+			if rule.ID == *params.ID {
+				p.rules = append(p.rules[:i:i], p.rules[i+1:]...)
+				return status{}
+			}
+		}
+		// What a real device says to an id it does not know has not been
+		// seen. This is a guess.
+		return invalidArgument
+	default:
+		return methodNotSupported
+	}
+}
+
+type rulesReply struct {
+	Rules     []Rule `json:"rule_list"`
+	Version   int    `json:"version"`
+	Enable    int    `json:"enable"`
+	ErrorCode int    `json:"err_code"`
 }
 
 // deviceTimeLocked returns the plug's own reading of the time: its clock
