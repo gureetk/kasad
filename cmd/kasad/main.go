@@ -35,8 +35,13 @@ The rules stored on the plug are ones it runs by itself, such as those made
 with the vendor's app. They are separate from the schedule that serve runs.
 
 serve can also offer a web app and a JSON API, at the address given with
--listen. If the environment variable KASAD_TOKEN is set, API requests must
-carry that token, and the web app asks for it.
+-listen. Two environment variables decide who may use them:
+
+  KASAD_PASSWORD  the password people sign in to the web app with
+  KASAD_TOKEN     a token for programs to send with their API requests
+
+With neither set, anyone who can reach the address can use both. Everything
+is sent over plain HTTP, so this is meant for a network you trust.
 
 Flags:
 `
@@ -168,6 +173,7 @@ func run(ctx context.Context, args []string, env environment) int {
 			syncInterval: *syncInterval,
 			listen:       *listen,
 			token:        env.getenv(tokenEnv),
+			password:     env.getenv(passwordEnv),
 		}, env)
 	}
 	if err != nil {

@@ -46,9 +46,12 @@ const MEMORY_KEY = 'kasad.plug';
 const byId = (id) => document.getElementById(id);
 
 const state = {
-  // screen is what fills the window: nothing yet, the app, or the request
-  // for a token.
+  // screen is what fills the window: nothing yet ('starting'), the app
+  // ('app'), or the request to sign in ('signin').
   screen: 'starting',
+  // session is kasad's last word on signing in: whether it is required,
+  // whether there is a password to do it with, and whether this browser has.
+  session: null,
   // link is whether kasad itself answers: not asked yet, yes, or no.
   link: 'starting',
   // status is kasad's last answer to GET api/status.
@@ -79,7 +82,7 @@ let loading = null;
 let pollTimer = 0;
 
 // refresh asks kasad for the latest and redraws. It resolves to 'ok',
-// 'token' (kasad wants a token it was not given), 'down' or 'stale'.
+// 'signin' (kasad wants the person to sign in), 'down' or 'stale'.
 function refresh(manual = false) {
   if (!loading) {
     byId('refresh').classList.toggle('is-busy', manual);
@@ -107,7 +110,12 @@ async function refreshAfterChange() {
 async function load() {
   const started = changes;
   try {
-    const [status, schedule] = await Promise.all([api.getStatus(), api.getSchedule()]);
+    const [status, schedule, session] = await Promise.all([
+      api.getStatus(),
+      api.getSchedule(),
+      // How signing in stands only changes when the page signs in or out.
+      state.session ? null : api.getSession(),
+    ]);
 
     let plugRules = null;
     let plugProblem = '';
@@ -143,13 +151,16 @@ async function load() {
     state.schedule = { rules: schedule.rules ?? [] };
     state.link = 'ok';
     state.screen = 'app';
+    if (session) {
+      state.session = session;
+    }
     if (status.plug.reachable) {
       remember(status.plug);
     }
     return 'ok';
   } catch (error) {
     if (unauthorized(error)) {
-      return 'token';
+      return 'signin';
     }
     state.link = 'down';
     if (state.screen === 'starting') {
@@ -161,24 +172,42 @@ async function load() {
 
 function planRefresh() {
   clearTimeout(pollTimer);
-  if (document.hidden || state.screen === 'token') {
+  if (document.hidden || state.screen === 'signin') {
     return;
   }
   pollTimer = setTimeout(refresh, state.link === 'down' ? RETRY_MS : REFRESH_MS);
 }
 
-// unauthorized reports whether an error is kasad asking for a token, and if
-// so turns to the token screen.
+// unauthorized reports whether an error is kasad saying that the person has
+// to sign in, and if so turns to the sign-in screen.
 function unauthorized(error) {
   if (!(error instanceof ApiError) || error.status !== 401) {
     return false;
   }
-  if (state.screen !== 'token') {
-    const hadToken = api.getToken() !== '';
-    showProblem(byId('token-error'), hadToken ? 'The token saved in this browser was not accepted.' : '');
+  if (state.screen !== 'signin') {
+    // If they were signed in until now, say that it has ended: it runs
+    // out after a while, and ends when kasad is restarted.
+    const ended = state.screen === 'app' && state.session?.signed_in;
+    showProblem(byId('sign-in-error'), ended ? 'Your sign-in has ended. Sign in again to carry on.' : '');
   }
-  state.screen = 'token';
+  state.screen = 'signin';
+  // Whether there is a password to give is not known yet if this is the
+  // first thing kasad has said. null stands for that.
+  state.session = { required: true, password: state.session?.password ?? null, signed_in: false };
+  learnSession();
   return true;
+}
+
+// learnSession asks kasad how signing in stands, which decides what the
+// sign-in screen offers.
+async function learnSession() {
+  try {
+    state.session = await api.getSession();
+  } catch {
+    // No answer. Offer the password form, which will say so if tried.
+    state.session.password ??= true;
+  }
+  render();
 }
 
 function readMemory() {
@@ -267,8 +296,22 @@ function currentView() {
   return location.hash === '#schedule' ? 'schedule' : 'plug';
 }
 
+let passwordFormShown = false;
+
 function render() {
-  byId('token-screen').hidden = state.screen !== 'token';
+  const signingIn = state.screen === 'signin';
+  byId('sign-in').hidden = !signingIn;
+  // The form is for a kasad with a password. One with only a token gets an
+  // explanation. Until kasad has said which it is, neither is shown.
+  const showForm = signingIn && state.session?.password === true;
+  byId('sign-in-with-password').hidden = !showForm;
+  byId('sign-in-unavailable').hidden = !(signingIn && state.session?.password === false);
+  // Over HTTPS, or on this machine alone, nobody can listen in.
+  byId('sign-in-plain').hidden = window.isSecureContext;
+  if (showForm && !passwordFormShown) {
+    byId('password-input').focus();
+  }
+  passwordFormShown = showForm;
   byId('app').hidden = state.screen !== 'app';
   if (state.screen !== 'app') {
     for (const dialog of [editor.dialog, sheet.dialog]) {
@@ -286,6 +329,11 @@ function render() {
   renderBars();
   renderNext();
   renderRules();
+  // Signing out is only on offer to someone who signed in.
+  const canSignOut = Boolean(state.session?.password && state.session.signed_in);
+  for (const button of document.querySelectorAll('[data-sign-out]')) {
+    button.hidden = !canSignOut;
+  }
   // What a dialog allows depends on whether the plug is answering.
   if (editor.dialog.open) {
     renderEditor();
@@ -715,7 +763,7 @@ async function saveRules(rules) {
   } catch (error) {
     state.schedule = before;
     if (unauthorized(error)) {
-      problem = 'kasad asked for a token.';
+      problem = 'You need to sign in again.';
     } else if (error instanceof ApiError) {
       problem = `kasad did not accept the change: ${error.message}`;
     } else {
@@ -748,7 +796,7 @@ async function changePlugRules(change) {
     await change();
   } catch (error) {
     if (unauthorized(error)) {
-      problem = 'kasad asked for a token.';
+      problem = 'You need to sign in again.';
     } else if (error instanceof ApiError) {
       problem = `The plug did not take the change: ${error.message}`;
     } else {
@@ -1136,45 +1184,97 @@ function wireSheet() {
 }
 
 // ---------------------------------------------------------------------------
-// The token screen
+// Signing in and out
 
-function wireTokenScreen() {
-  const input = byId('token-input');
-  const reveal = byId('token-reveal');
-  const submit = byId('token-submit');
+function wireSignIn() {
+  const input = byId('password-input');
+  const reveal = byId('password-reveal');
+  const submit = byId('sign-in-submit');
+  const problem = byId('sign-in-error');
 
-  reveal.addEventListener('click', () => {
-    const show = input.type === 'password';
-    input.type = show ? 'text' : 'password';
-    reveal.setAttribute('aria-pressed', String(show));
-    reveal.setAttribute('aria-label', show ? 'Hide token' : 'Show token');
-  });
+  const show = (visible) => {
+    input.type = visible ? 'text' : 'password';
+    reveal.setAttribute('aria-pressed', String(visible));
+    reveal.setAttribute('aria-label', visible ? 'Hide password' : 'Show password');
+  };
+  reveal.addEventListener('click', () => show(input.type === 'password'));
 
-  byId('token-form').addEventListener('submit', async (event) => {
+  byId('sign-in-form').addEventListener('submit', async (event) => {
     event.preventDefault();
-    const token = input.value.trim();
-    if (token === '') {
-      showProblem(byId('token-error'), 'Enter the token.');
+    if (submit.disabled) {
       return;
     }
-    api.setToken(token);
+    // The password is sent as typed: spaces at either end may be part of it.
+    if (input.value === '') {
+      showProblem(problem, 'Enter the password.');
+      return;
+    }
     submit.disabled = true;
-    showProblem(byId('token-error'), '');
+    showProblem(problem, '');
+    try {
+      state.session = await api.signIn(input.value);
+    } catch (error) {
+      submit.disabled = false;
+      showProblem(problem, signInProblem(error));
+      input.select();
+      return;
+    }
+    submit.disabled = false;
+    input.value = '';
+    show(false);
+
+    // Start again as though the page had just been opened.
+    state.screen = 'starting';
+    state.link = 'starting';
+    state.plugRules.at = 0;
+    render();
     if (loading) {
       await loading;
     }
-    const outcome = await refresh();
-    submit.disabled = false;
-    if (outcome === 'token') {
-      showProblem(byId('token-error'), 'That token was not accepted.');
-    } else if (outcome === 'down') {
-      state.screen = 'token';
-      render();
-      showProblem(byId('token-error'), "Can't reach kasad.");
-    } else {
-      input.value = '';
-    }
+    refresh();
   });
+
+  for (const button of document.querySelectorAll('[data-sign-out]')) {
+    button.addEventListener('click', signOut);
+  }
+}
+
+// signInProblem puts into words why signing in did not work.
+function signInProblem(error) {
+  if (!(error instanceof ApiError)) {
+    return "Can't reach kasad.";
+  }
+  switch (error.status) {
+    case 401:
+      return 'Wrong password.';
+    case 429: {
+      const seconds = /(\d+) s/.exec(error.message)?.[1];
+      return seconds
+        ? `Too many wrong passwords. Try again in ${seconds} s.`
+        : 'Too many wrong passwords. Try again shortly.';
+    }
+    case 409:
+      // kasad has no password after all. Find out what it does have.
+      learnSession();
+      return 'Sign-in is not set up on this kasad.';
+    default:
+      return `kasad did not accept that: ${error.message}`;
+  }
+}
+
+async function signOut() {
+  try {
+    state.session = await api.signOut();
+  } catch {
+    toast("Couldn't sign out: kasad did not answer.");
+    return;
+  }
+  // Drop any answer still on its way, and stop asking.
+  changes++;
+  clearTimeout(pollTimer);
+  showProblem(byId('sign-in-error'), '');
+  state.screen = 'signin';
+  render();
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,12 +1310,12 @@ function wire() {
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       clearTimeout(pollTimer);
-    } else if (state.screen !== 'token') {
+    } else if (state.screen !== 'signin') {
       refresh();
     }
   });
   window.addEventListener('online', () => {
-    if (state.screen !== 'token') {
+    if (state.screen !== 'signin') {
       refresh();
     }
   });
@@ -1233,7 +1333,15 @@ function wire() {
 
   wireEditor();
   wireSheet();
-  wireTokenScreen();
+  wireSignIn();
+}
+
+// An earlier version of this page kept an API token here. Nothing uses it
+// now, so it should not be left lying about.
+try {
+  localStorage.removeItem('kasad.token');
+} catch {
+  // No storage, so nothing to clear.
 }
 
 wire();

@@ -35,28 +35,40 @@
 
 <noscript><p class="noscript">This page needs JavaScript to talk to kasad.</p></noscript>
 
-<div id="token-screen" class="token" hidden>
-<main class="token__main">
+<div id="sign-in" class="signin" hidden>
+<main class="signin__main">
 <div class="brand">
 <span class="brand__mark" aria-hidden="true"><svg class="icon"><use href="#i-power"/></svg></span>
 <span class="brand__name">kasad</span>
 </div>
-<div class="token__intro">
-<h1>Enter your token</h1>
-<p>This kasad only answers requests that carry its token.</p>
+
+<div id="sign-in-with-password" class="signin__part">
+<div class="signin__intro">
+<h1>Sign in</h1>
+<p>Enter the password for this kasad.</p>
 </div>
-<form id="token-form" class="card token__form" novalidate>
-<label for="token-input" class="label">Token</label>
+<form id="sign-in-form" class="card signin__form" novalidate>
+<input class="visually-hidden" type="text" name="username" value="kasad" autocomplete="username" tabindex="-1" aria-hidden="true" readonly>
+<label for="password-input" class="label">Password</label>
 <div class="field">
-<input id="token-input" class="field__input" type="password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" required>
-<button type="button" id="token-reveal" class="field__button" aria-pressed="false" aria-label="Show token"><svg class="icon" aria-hidden="true"><use href="#i-eye"/></svg></button>
+<input id="password-input" class="field__input" type="password" name="password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+<button type="button" id="password-reveal" class="field__button" aria-pressed="false" aria-label="Show password"><svg class="icon" aria-hidden="true"><use href="#i-eye"/></svg></button>
 </div>
-<p id="token-error" class="problem" role="alert" hidden></p>
-<button type="submit" id="token-submit" class="button">Connect</button>
+<p id="sign-in-error" class="problem" role="alert" hidden></p>
+<button type="submit" id="sign-in-submit" class="button">Sign in</button>
 </form>
-<p class="hint">The token is the value of KASAD_TOKEN on the machine that runs kasad. This browser remembers it after you connect.</p>
+<p class="hint">The password is set with KASAD_PASSWORD on the machine that runs kasad. You stay signed in on this browser for 30 days.</p>
+</div>
+
+<div id="sign-in-unavailable" class="signin__part" hidden>
+<div class="signin__intro">
+<h1>Sign-in is not set up</h1>
+<p>This kasad asks for a token, which is meant for programs. To use this page, start kasad with a password as well, by setting KASAD_PASSWORD on the machine that runs it.</p>
+</div>
+</div>
+
 </main>
-<p class="token__foot">kasad runs on your own network. Nothing leaves it.</p>
+<p class="signin__foot">Meant for use on your own network.<span id="sign-in-plain"> This connection is not encrypted.</span></p>
 </div>
 
 <div id="app" class="app" hidden>
@@ -74,6 +86,7 @@
 <span class="nav__icon" aria-hidden="true"><svg class="icon"><use href="#i-calendar"/></svg></span>
 <span class="nav__label">Schedule</span>
 </a>
+<button type="button" class="nav__signout" data-sign-out hidden>Sign out</button>
 </nav>
 
 <div class="page">
@@ -152,6 +165,8 @@
 
 </div>
 </div>
+
+<button type="button" class="signout" data-sign-out hidden>Sign out</button>
 </main>
 
 <main id="view-schedule" class="view" hidden>

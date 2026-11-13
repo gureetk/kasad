@@ -1,6 +1,6 @@
 // Package api serves kasad's JSON API over HTTP.
 //
-// The API has eight operations, all under /api/:
+// The API has these operations, all under /api/:
 //
 //	GET    /api/status           the plug's state and the next scheduled event
 //	POST   /api/relay            switch the plug on or off
@@ -10,6 +10,9 @@
 //	POST   /api/plug/rules       add a rule to the plug's own
 //	PUT    /api/plug/rules/{id}  change one of the plug's own rules
 //	DELETE /api/plug/rules/{id}  delete one of the plug's own rules
+//	GET    /api/session          whether the caller must, and has, signed in
+//	POST   /api/session          sign in with the password
+//	DELETE /api/session          sign out
 //
 // Requests and responses are JSON. An error response has the form
 // {"error": "..."}.
@@ -17,7 +20,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -54,9 +56,18 @@ type Server struct {
 	// Store holds the schedule the API reads and replaces.
 	Store *schedule.Store
 
-	// Token, if not empty, must accompany every request as an
-	// "Authorization: Bearer" header.
+	// Token, if not empty, lets a request use the API when it carries it
+	// in an "Authorization: Bearer" header. It is meant for programs.
 	Token string
+
+	// Password, if not empty, is what a person gives to sign in. A
+	// request then counts as theirs for as long as it carries the cookie
+	// that signing in sets. It is meant for the web app.
+	//
+	// When Token and Password are both empty, the API is open to anyone
+	// who can reach it. When either is set, every request must show one
+	// of the two, except those to /api/session.
+	Password string
 
 	// Now returns the current time. It defaults to time.Now.
 	Now func() time.Time
@@ -64,6 +75,9 @@ type Server struct {
 	// Logger receives a record of the changes made through the API. It
 	// defaults to discarding everything.
 	Logger *slog.Logger
+
+	sessions sessions
+	attempts attempts
 }
 
 // routes lists the API's fixed paths and the methods each one allows.
@@ -72,7 +86,12 @@ var routes = map[string]string{
 	"/api/relay":      "POST",
 	"/api/schedule":   "GET, HEAD, PUT",
 	"/api/plug/rules": "GET, HEAD, POST",
+	"/api/session":    "DELETE, GET, HEAD, POST",
 }
+
+// sessionPath is where a caller signs in and out. It has to answer callers
+// who have not signed in yet.
+const sessionPath = "/api/session"
 
 // plugRulePrefix is the path of one of the plug's own rules, less its id.
 const plugRulePrefix = "/api/plug/rules/"
@@ -100,6 +119,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/plug/rules", s.postPlugRule)
 	mux.HandleFunc("PUT "+plugRulePrefix+"{id}", s.putPlugRule)
 	mux.HandleFunc("DELETE "+plugRulePrefix+"{id}", s.deletePlugRule)
+	mux.HandleFunc("GET "+sessionPath, s.getSession)
+	mux.HandleFunc("POST "+sessionPath, s.postSession)
+	mux.HandleFunc("DELETE "+sessionPath, s.deleteSession)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		if allowed, ok := allowedMethods(r.URL.Path); ok {
 			w.Header().Set("Allow", allowed)
@@ -119,9 +141,19 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		header.Set("Cache-Control", "no-store")
 		header.Set("X-Content-Type-Options", "nosniff")
 
-		if s.Token != "" && !s.authorized(r) {
-			header.Set("WWW-Authenticate", "Bearer")
-			writeError(w, http.StatusUnauthorized, "missing or wrong token")
+		changes := r.Method != http.MethodGet && r.Method != http.MethodHead
+		if changes && crossSite(r) {
+			writeError(w, http.StatusForbidden, "this request was sent from a page on another site")
+			return
+		}
+
+		if !s.open() && r.URL.Path != sessionPath && !s.authorized(r) {
+			message := "sign in first"
+			if s.Token != "" {
+				header.Set("WWW-Authenticate", "Bearer")
+				message = "sign in first, or send the token"
+			}
+			writeError(w, http.StatusUnauthorized, message)
 			return
 		}
 
@@ -145,15 +177,6 @@ func (s *Server) guard(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
-}
-
-// authorized reports whether r carries the server's token.
-func (s *Server) authorized(r *http.Request) bool {
-	scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(token)), []byte(s.Token)) == 1
 }
 
 func (s *Server) now() time.Time {

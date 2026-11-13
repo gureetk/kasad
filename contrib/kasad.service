@@ -21,8 +21,9 @@ ExecStart=/usr/local/bin/kasad -data /var/lib/kasad serve
 # To offer the web app and JSON API as well, add -listen to the line above,
 # for example
 #   ExecStart=/usr/local/bin/kasad -data /var/lib/kasad -listen 127.0.0.1:8080 serve
-# and, if it listens beyond this machine, set a token in a file that only
-# root can read, containing the line KASAD_TOKEN=...:
+# and, if it listens beyond this machine, set a password for the web app in a
+# file that only root can read, containing the line KASAD_PASSWORD=... (and
+# KASAD_TOKEN=... if programs are to use the API):
 #   EnvironmentFile=/etc/kasad.env
 Restart=on-failure
 RestartSec=5
