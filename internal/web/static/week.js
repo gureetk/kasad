@@ -198,3 +198,112 @@ export function cleanRule(rule) {
   clean.action = rule.action === 'off' ? 'off' : 'on';
   return clean;
 }
+
+// What follows is for the rules a plug stores and runs by itself. The API
+// describes one with "enabled" where kasad's own rules have "disabled", and
+// with an "at" that says whether it goes by the clock, sunrise or sunset.
+
+// asWeeklyRule turns one of the plug's rules into the form kasad's own rules
+// take, so that it can be drawn and edited the same way. It only makes sense
+// for a rule the API marks as weekly.
+export function asWeeklyRule(rule) {
+  return {
+    id: rule.id,
+    name: rule.name ?? '',
+    disabled: !rule.enabled,
+    days: sortDays(rule.days ?? []),
+    time: rule.time,
+    action: rule.action === 'off' ? 'off' : 'on',
+  };
+}
+
+// plugRuleBody is what to send the API to store a rule on the plug.
+export function plugRuleBody(rule) {
+  return {
+    name: (rule.name ?? '').trim(),
+    enabled: !rule.disabled,
+    days: sortDays(rule.days ?? []),
+    time: rule.time,
+    action: rule.action === 'off' ? 'off' : 'on',
+  };
+}
+
+// plugRuleTime is the short form of when one of the plug's rules runs:
+// "07:30", "Sunrise", "Sunset" or, for a rule the page cannot read, "?".
+export function plugRuleTime(rule) {
+  switch (rule.at) {
+    case 'time':
+      return rule.time ?? '?';
+    case 'sunrise':
+      return 'Sunrise';
+    case 'sunset':
+      return 'Sunset';
+    default:
+      return '?';
+  }
+}
+
+function moment(part) {
+  switch (part.at) {
+    case 'time':
+      return part.time ? `at ${part.time}` : '';
+    case 'sunrise':
+      return 'at sunrise';
+    case 'sunset':
+      return 'at sunset';
+    default:
+      return '';
+  }
+}
+
+function doing(action) {
+  return action === 'on' || action === 'off' ? `Turns the plug ${action}` : 'Does something this page cannot read';
+}
+
+// describePlugRuleDays says which days one of the plug's rules runs on.
+export function describePlugRuleDays(rule) {
+  const days = describeDays(rule.days ?? []) || 'No days';
+  return rule.repeats ? days : `Once (${days})`;
+}
+
+// describePlugRule says in a few sentences what one of the plug's rules
+// does, including the kinds kasad's own schedule has no equivalent of.
+export function describePlugRule(rule) {
+  const days = sortDays(rule.days ?? []);
+  let when = '';
+  if (!rule.repeats) {
+    when = 'once';
+  } else if (presetOf(days) === 'all') {
+    when = 'every day';
+  } else if (presetOf(days) === 'weekdays') {
+    when = 'on weekdays';
+  } else if (days.length > 0) {
+    when = `on ${list(days.map((day) => `${DAY_NAMES[day].long}s`))}`;
+  }
+  const sentences = [`${[doing(rule.action), moment(rule), when].filter(Boolean).join(' ')}.`];
+  if (rule.end) {
+    const then = rule.end.action === 'on' || rule.end.action === 'off' ? `turns it ${rule.end.action}` : 'does something else';
+    sentences.push(`Then ${[then, moment(rule.end)].filter(Boolean).join(' ')}.`);
+  }
+  if (!rule.enabled) {
+    sentences.push('It is switched off on the plug, so it will not run.');
+  }
+  return sentences.join(' ');
+}
+
+// nextEvent finds the next moment the rules switch the plug, counting from
+// a weekday (Monday is 0) and a number of seconds into that day. It returns
+// the action, the minute of the day it falls on, and how many seconds away
+// it is, or null if the rules never switch anything.
+export function nextEvent(rules, weekday, secondsIntoDay) {
+  const events = weekEvents(rules);
+  if (events.length === 0) {
+    return null;
+  }
+  const nowSeconds = weekday * MINUTES_PER_DAY * 60 + secondsIntoDay;
+  const weekSeconds = MINUTES_PER_WEEK * 60;
+  const upcoming = events.find((event) => event.minute * 60 > nowSeconds);
+  const event = upcoming ?? events[0];
+  const until = event.minute * 60 - nowSeconds + (upcoming ? 0 : weekSeconds);
+  return { action: event.action, minuteOfDay: event.minute % MINUTES_PER_DAY, secondsUntil: until };
+}

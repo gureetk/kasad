@@ -35,6 +35,7 @@ test('wallParts counts the week from Monday', () => {
   const parts = wallParts(parseServerTime('2030-01-02T19:42:05+09:00').wall);
   assert.equal(parts.weekday, 2);
   assert.equal(parts.minuteOfDay, 19 * 60 + 42);
+  assert.equal(parts.secondOfDay, (19 * 60 + 42) * 60 + 5);
   assert.equal(wallParts(parseServerTime('2030-01-06T00:00:00Z').wall).weekday, 6);
   assert.equal(wallParts(parseServerTime('2030-01-07T00:00:00Z').wall).weekday, 0);
 });

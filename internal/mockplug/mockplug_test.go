@@ -472,8 +472,123 @@ func TestDeleteRuleRejectsWhatItCannotDelete(t *testing.T) {
 
 func TestScheduleMethodsTheMockLacks(t *testing.T) {
 	plug := startPlug(t)
-	reply := send(t, plug.Addr(), `{"schedule":{"add_rule":{}}}`)
-	if code := errCode(t, methods(t, reply["schedule"])["add_rule"]); code != -2 {
+	reply := send(t, plug.Addr(), `{"schedule":{"delete_all_rules":{}}}`)
+	if code := errCode(t, methods(t, reply["schedule"])["delete_all_rules"]); code != -2 {
 		t.Errorf("err_code = %d, want -2", code)
+	}
+}
+
+// newRule is a complete add_rule argument, as a client sends it: on at 18:05
+// on Mondays and Fridays.
+const newRule = `{"name":"evening","enable":1,"repeat":1,"wday":[0,1,0,0,0,1,0],` +
+	`"stime_opt":0,"smin":1085,"sact":1,"etime_opt":-1,"emin":0,"eact":-1,` +
+	`"year":0,"month":0,"day":0,"force":0,"longitude":0,"latitude":0}`
+
+func TestAddRule(t *testing.T) {
+	plug := startPlug(t)
+	plug.SetRules(testRules...)
+
+	reply := send(t, plug.Addr(), `{"schedule":{"add_rule":`+newRule+`}}`)
+	raw := methods(t, reply["schedule"])["add_rule"]
+	if code := errCode(t, raw); code != 0 {
+		t.Fatalf("err_code = %d, want 0", code)
+	}
+	var added struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &added); err != nil || len(added.ID) != 32 {
+		t.Fatalf("reply %s does not carry a 32-character id", raw)
+	}
+
+	rules := plug.Rules()
+	if len(rules) != 3 {
+		t.Fatalf("%d rules stored, want 3", len(rules))
+	}
+	want := mockplug.Rule{
+		ID: added.ID, Name: "evening", Enable: 1, Repeat: 1,
+		Weekdays: [7]int{0, 1, 0, 0, 0, 1, 0}, StartOption: 0, StartMinute: 1085, StartAction: 1, EndAction: -1,
+	}
+	if rules[2] != want {
+		t.Errorf("stored rule:\n got %+v\nwant %+v", rules[2], want)
+	}
+
+	// A second rule gets an id of its own.
+	reply = send(t, plug.Addr(), `{"schedule":{"add_rule":`+newRule+`}}`)
+	var second struct {
+		ID string `json:"id"`
+	}
+	json.Unmarshal(methods(t, reply["schedule"])["add_rule"], &second)
+	if second.ID == "" || second.ID == added.ID {
+		t.Errorf("second rule got the id %q, the first %q", second.ID, added.ID)
+	}
+}
+
+func TestAddRuleRejectsBadArguments(t *testing.T) {
+	plug := startPlug(t)
+	for name, args := range map[string]string{
+		"nothing":          `{}`,
+		"not an object":    `[]`,
+		"six days":         `{"enable":1,"repeat":1,"wday":[1,1,1,1,1,1],"stime_opt":0,"smin":60,"sact":1}`,
+		"a day flag of 2":  `{"enable":1,"repeat":1,"wday":[2,0,0,0,0,0,0],"stime_opt":0,"smin":60,"sact":1}`,
+		"no days field":    `{"enable":1,"repeat":1,"stime_opt":0,"smin":60,"sact":1}`,
+		"minute too large": `{"enable":1,"repeat":1,"wday":[1,0,0,0,0,0,0],"stime_opt":0,"smin":1440,"sact":1}`,
+		"no action":        `{"enable":1,"repeat":1,"wday":[1,0,0,0,0,0,0],"stime_opt":0,"smin":60}`,
+		"action of 5":      `{"enable":1,"repeat":1,"wday":[1,0,0,0,0,0,0],"stime_opt":0,"smin":60,"sact":5}`,
+		"enable of 3":      `{"enable":3,"repeat":1,"wday":[1,0,0,0,0,0,0],"stime_opt":0,"smin":60,"sact":1}`,
+	} {
+		reply := send(t, plug.Addr(), `{"schedule":{"add_rule":`+args+`}}`)
+		if code := errCode(t, methods(t, reply["schedule"])["add_rule"]); code != -3 {
+			t.Errorf("%s: err_code = %d, want -3", name, code)
+		}
+	}
+	if stored := plug.Rules(); len(stored) != 0 {
+		t.Errorf("%d rules stored from bad requests", len(stored))
+	}
+}
+
+func TestEditRule(t *testing.T) {
+	plug := startPlug(t)
+	plug.SetRules(testRules...)
+
+	change := `{"id":"00000000000000000000000000000001",` + newRule[1:]
+	reply := send(t, plug.Addr(), `{"schedule":{"edit_rule":`+change+`}}`)
+	if code := errCode(t, methods(t, reply["schedule"])["edit_rule"]); code != 0 {
+		t.Fatalf("err_code = %d, want 0", code)
+	}
+	rules := plug.Rules()
+	want := mockplug.Rule{
+		ID: "00000000000000000000000000000001", Name: "evening", Enable: 1, Repeat: 1,
+		Weekdays: [7]int{0, 1, 0, 0, 0, 1, 0}, StartOption: 0, StartMinute: 1085, StartAction: 1, EndAction: -1,
+	}
+	if len(rules) != 2 || rules[0] != want || rules[1] != testRules[1] {
+		t.Errorf("rules after the edit: %+v", rules)
+	}
+
+	// A rule the plug does not have cannot be changed.
+	for _, args := range []string{`{"id":"no-such-rule",` + newRule[1:], newRule} {
+		reply := send(t, plug.Addr(), `{"schedule":{"edit_rule":`+args+`}}`)
+		if code := errCode(t, methods(t, reply["schedule"])["edit_rule"]); code != -3 {
+			t.Errorf("edit_rule %s: err_code = %d, want -3", args, code)
+		}
+	}
+}
+
+func TestForgetfulPlugStoresNothing(t *testing.T) {
+	plug := startPlug(t)
+	plug.SetRules(testRules...)
+	plug.SetForgetful(true)
+
+	for method, args := range map[string]string{
+		"add_rule":  newRule,
+		"edit_rule": `{"id":"00000000000000000000000000000001",` + newRule[1:],
+	} {
+		reply := send(t, plug.Addr(), `{"schedule":{"`+method+`":`+args+`}}`)
+		if code := errCode(t, methods(t, reply["schedule"])[method]); code != 0 {
+			t.Errorf("%s: err_code = %d, want 0", method, code)
+		}
+	}
+	rules := plug.Rules()
+	if len(rules) != 2 || rules[0] != testRules[0] || rules[1] != testRules[1] {
+		t.Errorf("a forgetful plug changed its rules: %+v", rules)
 	}
 }
