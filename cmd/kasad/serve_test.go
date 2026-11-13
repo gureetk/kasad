@@ -77,6 +77,15 @@ func startServe(t *testing.T, mock *mockplug.Plug, dir string, flags ...string) 
 // startServeWithEnv is startServe with environment variables set.
 func startServeWithEnv(t *testing.T, mock *mockplug.Plug, dir string, vars map[string]string, flags ...string) *serving {
 	t.Helper()
+	args := append([]string{"-host", mock.Addr(), "-data", dir}, flags...)
+	return startServeWithArgs(t, dir, vars, append(args, "serve"))
+}
+
+// startServeWithArgs runs kasad with exactly the given arguments and
+// environment variables, for tests of where serve takes its settings from.
+// dir is the data directory those settings lead to.
+func startServeWithArgs(t *testing.T, dir string, vars map[string]string, args []string) *serving {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &serving{
 		t:      t,
@@ -87,8 +96,6 @@ func startServeWithEnv(t *testing.T, mock *mockplug.Plug, dir string, vars map[s
 		cancel: cancel,
 		done:   make(chan int, 1),
 	}
-	args := append([]string{"-host", mock.Addr(), "-data", dir}, flags...)
-	args = append(args, "serve")
 	go func() {
 		s.done <- run(ctx, args, environment{
 			stdout:        s.stdout,
@@ -724,6 +731,166 @@ func TestServeKeepsPeopleSignedInAcrossARestart(t *testing.T) {
 	third := start("another password")
 	if code := status(third); code != http.StatusUnauthorized {
 		t.Errorf("GET /api/status after the password changed = %d, want 401", code)
+	}
+}
+
+func TestServeSettingsFromTheEnvironment(t *testing.T) {
+	mock := startMock(t)
+	behind := testNow.Add(-5 * time.Minute)
+	mock.SetClock(func() time.Time { return behind })
+	dir := t.TempDir()
+	writeSchedule(t, dir, `{"rules": [{"id": "evening", "days": ["sat"], "time": "18:00", "action": "on"}]}`)
+
+	// Nothing on the command line but the command: where the plug is, where
+	// the data is, where to listen and how often to set the clock all come
+	// from the environment.
+	vars := map[string]string{
+		"KASAD_HOST":          mock.Addr(),
+		"KASAD_DATA":          dir,
+		"KASAD_LISTEN":        "127.0.0.1:0",
+		"KASAD_SYNC_INTERVAL": "0",
+	}
+	s := startServeWithArgs(t, dir, vars, []string{"serve"})
+
+	code, body := s.request("GET", "/api/schedule", "", nil)
+	if code != http.StatusOK || !strings.Contains(body, `"evening"`) {
+		t.Errorf("GET /api/schedule = %d, want 200 with the schedule from the data directory:\n%s", code, body)
+	}
+	if code, body := s.request("GET", "/api/status", "", nil); code != http.StatusOK || !strings.Contains(body, `"reachable": true`) {
+		t.Errorf("GET /api/status = %d, want 200 from a plug that answers:\n%s", code, body)
+	}
+	s.settle()
+	s.stop()
+	if !mock.Time().Equal(behind) {
+		t.Errorf("the plug's clock was changed to %v though the interval from the environment is 0", mock.Time())
+	}
+}
+
+func TestServeFlagsWinOverTheEnvironment(t *testing.T) {
+	mock := startMock(t)
+	dir := t.TempDir()
+	vars := map[string]string{
+		"KASAD_HOST":   "192.0.2.1:9", // nothing answers there
+		"KASAD_DATA":   filepath.Join(dir, "missing"),
+		"KASAD_LISTEN": "256.0.0.1:80", // not an address at all
+	}
+	s := startServeWithEnv(t, mock, dir, vars, "-sync-interval", "0", "-listen", "127.0.0.1:0")
+	if code, body := s.request("GET", "/api/status", "", nil); code != http.StatusOK || !strings.Contains(body, `"reachable": true`) {
+		t.Errorf("GET /api/status = %d, want 200 from the plug named on the command line:\n%s", code, body)
+	}
+}
+
+func TestServeSaysWhatItIsAndWhatTimeItGoesBy(t *testing.T) {
+	mock := startMock(t)
+	old := version
+	version = "v9.9.9"
+	t.Cleanup(func() { version = old })
+
+	s := startServe(t, mock, t.TempDir(), "-sync-interval", "0")
+	s.waitForLog("msg=starting version=v9.9.9 ")
+	// The time is given with its offset from UTC, which is how to tell
+	// that kasad has the timezone it is meant to.
+	s.waitForLog("local_time=2001-02-03T04:05:06Z")
+}
+
+func TestServeSecretsFromFiles(t *testing.T) {
+	mock := startMock(t)
+	secrets := t.TempDir()
+	passwordFile := filepath.Join(secrets, "password")
+	tokenFile := filepath.Join(secrets, "token")
+	// As an editor or "echo" leaves them: with a line ending, which is not
+	// part of the secret.
+	if err := os.WriteFile(passwordFile, []byte("correct horse\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tokenFile, []byte("t0ken\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	vars := map[string]string{
+		passwordEnv + fileSuffix: passwordFile,
+		tokenEnv + fileSuffix:    tokenFile,
+	}
+	s := startServeWithEnv(t, mock, t.TempDir(), vars, "-sync-interval", "0", "-listen", "127.0.0.1:0")
+
+	if code, body := s.request("GET", "/api/status", "", nil); code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/status with nothing shown = %d, want 401:\n%s", code, body)
+	}
+	bearer := map[string]string{"Authorization": "Bearer t0ken"}
+	if code, body := s.request("GET", "/api/status", "", bearer); code != http.StatusOK {
+		t.Errorf("GET /api/status with the token from the file = %d, want 200:\n%s", code, body)
+	}
+	if code, body := s.request("POST", "/api/session", `{"password": "correct horse"}`, nil); code != http.StatusOK {
+		t.Errorf("signing in with the password from the file = %d, want 200:\n%s", code, body)
+	}
+	if code, _ := s.request("POST", "/api/session", `{"password": "correct horse\n"}`, nil); code != http.StatusUnauthorized {
+		t.Errorf("signing in with the line ending included = %d, want 401", code)
+	}
+
+	s.stop()
+	for _, secret := range []string{"correct horse", "t0ken"} {
+		if strings.Contains(s.stderr.String(), secret) {
+			t.Errorf("%q is in the log:\n%s", secret, s.stderr.String())
+		}
+	}
+}
+
+func TestServeRefusesSecretsItCannotBeSureOf(t *testing.T) {
+	mock := startMock(t)
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	good := write("good", "correct horse\n")
+	empty := write("empty", "")
+	blank := write("blank", "\n")
+	missing := filepath.Join(dir, "missing")
+
+	tests := []struct {
+		name string
+		vars map[string]string
+		want []string // all of these are in the message
+	}{
+		{"password given twice", map[string]string{passwordEnv: "correct horse", passwordEnv + fileSuffix: good},
+			[]string{"KASAD_PASSWORD and KASAD_PASSWORD_FILE are both set"}},
+		{"token given twice", map[string]string{tokenEnv: "t0ken", tokenEnv + fileSuffix: good},
+			[]string{"KASAD_TOKEN and KASAD_TOKEN_FILE are both set"}},
+		{"no such file", map[string]string{passwordEnv + fileSuffix: missing},
+			[]string{"KASAD_PASSWORD_FILE", missing}},
+		{"empty file", map[string]string{passwordEnv + fileSuffix: empty},
+			[]string{"KASAD_PASSWORD_FILE", empty, "is empty"}},
+		{"file with only a line ending", map[string]string{tokenEnv + fileSuffix: blank},
+			[]string{"KASAD_TOKEN_FILE", blank, "is empty"}},
+		{"a directory", map[string]string{tokenEnv + fileSuffix: dir},
+			[]string{"KASAD_TOKEN_FILE", dir}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Were serve to start, this would not return. It must stop
+			// first, and not fall back to serving with no protection.
+			got := kasad(t, test.vars, "-host", mock.Addr(), "-data", t.TempDir(), "-listen", "127.0.0.1:0", "serve")
+			if got.code != exitFailed {
+				t.Errorf("exit code = %d, want %d", got.code, exitFailed)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(got.stderr, want) {
+					t.Errorf("the message does not mention %q:\n%s", want, got.stderr)
+				}
+			}
+			if strings.Contains(got.stderr, "correct horse") || strings.Contains(got.stderr, "t0ken") {
+				t.Errorf("a secret is in the message:\n%s", got.stderr)
+			}
+			if strings.Contains(got.stderr, "serving the web app") {
+				t.Errorf("serve started all the same:\n%s", got.stderr)
+			}
+		})
+	}
+	if mock.Requests() != 0 {
+		t.Errorf("%d requests reached the plug, want none", mock.Requests())
 	}
 }
 

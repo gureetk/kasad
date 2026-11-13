@@ -1,11 +1,16 @@
 # Sample systemd unit for kasad.
 #
 # 1. Install the binary as /usr/local/bin/kasad.
-# 2. Copy this file to /etc/systemd/system/kasad.service and set KASAD_HOST
-#    to the plug's address.
-# 3. Run: systemctl daemon-reload && systemctl enable --now kasad
-# 4. Put the schedule in /var/lib/kasad/schedule.json, then run:
-#    systemctl restart kasad
+# 2. Copy kasad.env.example to /etc/kasad.env and set KASAD_HOST in it to the
+#    plug's address. To offer the web app and the JSON API as well, set
+#    KASAD_LISTEN there, and KASAD_PASSWORD if other machines can reach it.
+#    Then let only root read the file:
+#      chown root:root /etc/kasad.env && chmod 600 /etc/kasad.env
+# 3. Copy this file to /etc/systemd/system/kasad.service.
+# 4. Run: systemctl daemon-reload && systemctl enable --now kasad
+#
+# The schedule can be made in the web app. To write it by hand instead, put
+# it in /var/lib/kasad/schedule.json and run: systemctl restart kasad
 #
 # Logs go to the journal: journalctl -u kasad
 
@@ -15,16 +20,8 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Environment=KASAD_HOST=192.0.2.10
+EnvironmentFile=/etc/kasad.env
 ExecStart=/usr/local/bin/kasad -data /var/lib/kasad serve
-
-# To offer the web app and JSON API as well, add -listen to the line above,
-# for example
-#   ExecStart=/usr/local/bin/kasad -data /var/lib/kasad -listen 127.0.0.1:8080 serve
-# and, if it listens beyond this machine, set a password for the web app in a
-# file that only root can read, containing the line KASAD_PASSWORD=... (and
-# KASAD_TOKEN=... if programs are to use the API):
-#   EnvironmentFile=/etc/kasad.env
 Restart=on-failure
 RestartSec=5
 

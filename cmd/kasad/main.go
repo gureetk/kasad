@@ -9,6 +9,9 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,6 +30,7 @@ Commands:
   delete-rule <id>  delete one of the rules stored on the plug
   serve             run the schedule in the data directory, and keep the
                     plug's clock set
+  version           show which version of kasad this is
 
 The plug keeps local time with no UTC offset. state, sync and serve assume
 that the plug is set to the same timezone as this machine.
@@ -43,12 +47,44 @@ serve can also offer a web app and a JSON API, at the address given with
 With neither set, anyone who can reach the address can use both. Everything
 is sent over plain HTTP, so this is meant for a network you trust.
 
+Either can be kept in a file instead, named by KASAD_PASSWORD_FILE or
+KASAD_TOKEN_FILE.
+
+Every flag below can also be set through the environment, under the name
+shown beside it. A flag on the command line wins.
+
 Flags:
 `
 
+// envPrefix begins the name of every environment variable kasad reads.
+const envPrefix = "KASAD_"
+
 // hostEnv names the environment variable that supplies the plug's address
 // when -host is not given.
-const hostEnv = "KASAD_HOST"
+const hostEnv = envPrefix + "HOST"
+
+// envName returns the name of the environment variable that stands in for a
+// flag: KASAD_SYNC_INTERVAL for -sync-interval, and so on.
+func envName(flagName string) string {
+	return envPrefix + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
+}
+
+// version is set when a release is built, with
+// -ldflags "-X main.version=v1.2.3".
+var version = ""
+
+// versionString returns the version of this build. Without one built in, it
+// is the version the Go tools recorded: the module's version for a build
+// made with "go install", or one worked out from the repository.
+func versionString() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "unknown"
+}
 
 // commands lists the commands and how many arguments each one takes.
 var commands = map[string]int{
@@ -59,6 +95,7 @@ var commands = map[string]int{
 	"rules":       0,
 	"delete-rule": 1,
 	"serve":       0,
+	"version":     0,
 }
 
 // Exit codes.
@@ -96,11 +133,14 @@ func main() {
 func run(ctx context.Context, args []string, env environment) int {
 	flags := flag.NewFlagSet("kasad", flag.ContinueOnError)
 	flags.SetOutput(env.stderr)
-	host := flags.String("host", "", "plug address, as host or host:port (default: $"+hostEnv+")")
+	host := flags.String("host", "", "plug address, as host or host:port")
 	timeout := flags.Duration("timeout", protocol.DefaultTimeout, "how long to wait for the plug to answer")
 	dataDir := flags.String("data", ".", "serve: directory holding "+scheduleFile+", and where progress is saved")
 	syncInterval := flags.Duration("sync-interval", time.Hour, "serve: how often to set the plug's clock (0 to never set it)")
 	listen := flags.String("listen", "", "serve: address to offer the web app and JSON API on, such as 127.0.0.1:8080 (default: neither)")
+	flags.VisitAll(func(f *flag.Flag) {
+		f.Usage += " [$" + envName(f.Name) + "]"
+	})
 	flags.Usage = func() {
 		fmt.Fprint(env.stderr, usage)
 		flags.PrintDefaults()
@@ -109,6 +149,10 @@ func run(ctx context.Context, args []string, env environment) int {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
 		}
+		return exitUsage
+	}
+	if err := flagsFromEnv(flags, env); err != nil {
+		fmt.Fprintf(env.stderr, "kasad: %v\n", err)
 		return exitUsage
 	}
 
@@ -134,9 +178,11 @@ func run(ctx context.Context, args []string, env environment) int {
 		return exitUsage
 	}
 
-	if *host == "" {
-		*host = env.getenv(hostEnv)
+	if command == "version" {
+		fmt.Fprintf(env.stdout, "kasad %s (%s, %s/%s)\n", versionString(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		return exitOK
 	}
+
 	if *host == "" {
 		fmt.Fprintf(env.stderr, "kasad: no plug address: pass -host or set %s\n", hostEnv)
 		return exitUsage
@@ -168,19 +214,71 @@ func run(ctx context.Context, args []string, env environment) int {
 	case "delete-rule":
 		err = deleteRule(ctx, p, flags.Arg(1), env)
 	case "serve":
-		err = serve(ctx, p, serveOptions{
+		opts := serveOptions{
 			dataDir:      *dataDir,
 			syncInterval: *syncInterval,
 			listen:       *listen,
-			token:        env.getenv(tokenEnv),
-			password:     env.getenv(passwordEnv),
-		}, env)
+		}
+		if opts.token, err = secret(env, tokenEnv); err != nil {
+			break
+		}
+		if opts.password, err = secret(env, passwordEnv); err != nil {
+			break
+		}
+		err = serve(ctx, p, opts, env)
 	}
 	if err != nil {
 		fmt.Fprintf(env.stderr, "kasad: %v\n", err)
 		return exitFailed
 	}
 	return exitOK
+}
+
+// flagsFromEnv gives each flag that was not on the command line the value of
+// its environment variable, if that is set. The value is read as it would be
+// on the command line.
+func flagsFromEnv(flags *flag.FlagSet, env environment) error {
+	given := make(map[string]bool)
+	flags.Visit(func(f *flag.Flag) { given[f.Name] = true })
+
+	var problem error
+	flags.VisitAll(func(f *flag.Flag) {
+		name := envName(f.Name)
+		value := env.getenv(name)
+		if given[f.Name] || value == "" || problem != nil {
+			return
+		}
+		if err := f.Value.Set(value); err != nil {
+			problem = fmt.Errorf("%s: %q is not a value -%s can take", name, value, f.Name)
+		}
+	})
+	return problem
+}
+
+// secret returns the secret that the environment variable name stands for.
+// That is the variable's own value or, if the variable name_FILE is set, the
+// contents of the file it names, less the line ending a file usually has.
+// Keeping a secret in a file keeps it out of the process's environment, and
+// is how container runtimes and systemd hand secrets over.
+func secret(env environment, name string) (string, error) {
+	value, path := env.getenv(name), env.getenv(name+fileSuffix)
+	switch {
+	case path == "":
+		return value, nil
+	case value != "":
+		return "", fmt.Errorf("%s and %s are both set; set only one", name, name+fileSuffix)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", name+fileSuffix, err)
+	}
+	value = strings.TrimRight(string(data), "\r\n")
+	if value == "" {
+		// An empty secret would mean none at all, and so no protection.
+		// Better to stop than to serve an open API by accident.
+		return "", fmt.Errorf("%s: %s is empty", name+fileSuffix, path)
+	}
+	return value, nil
 }
 
 // showState prints a summary of the plug.

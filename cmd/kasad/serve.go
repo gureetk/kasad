@@ -32,9 +32,13 @@ const (
 // for people. They are read from the environment, not from flags, so that
 // they do not show up in the process list.
 const (
-	tokenEnv    = "KASAD_TOKEN"
-	passwordEnv = "KASAD_PASSWORD"
+	tokenEnv    = envPrefix + "TOKEN"
+	passwordEnv = envPrefix + "PASSWORD"
 )
+
+// fileSuffix, added to either name, names the variable that points to a file
+// holding the secret instead.
+const fileSuffix = "_FILE"
 
 // shortPassword is the length below which serve remarks on the password.
 const shortPassword = 8
@@ -94,7 +98,10 @@ func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment
 			enabled++
 		}
 	}
-	logger.Info("starting", "plug", p.Addr, "rules", len(rules.Rules), "enabled", enabled)
+	// The time is logged with its offset from UTC, because rules run by this
+	// machine's local time. In a container that is UTC unless TZ is set.
+	logger.Info("starting", "version", versionString(), "plug", p.Addr,
+		"rules", len(rules.Rules), "enabled", enabled, "local_time", env.now().Format(time.RFC3339))
 	if next, ok := rules.Next(env.now()); ok {
 		logger.Info("next event",
 			"rule", next.Rule.ID, "action", string(next.Rule.Action), "at", next.At.Format(time.RFC3339))

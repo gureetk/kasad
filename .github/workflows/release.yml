@@ -1,0 +1,120 @@
+name: Release
+
+# Pushing a tag such as v1.2.3 makes a release: archives of the binary on the
+# repository's Releases page, and a container image on ghcr.io.
+#
+# A pull request that changes how a release is built goes through the same
+# steps without publishing anything, so that a change is tried before a
+# release depends on it.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .dockerignore
+      - Dockerfile
+      - contrib/**
+      - go.mod
+      - scripts/**
+
+permissions:
+  contents: read
+
+env:
+  # On a tag, the tag itself. Otherwise a name that cannot be mistaken for a
+  # release.
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('v0.0.0-{0}', github.sha) }}
+  # A tag with a hyphen, such as v1.2.3-rc.1, is a pre-release.
+  PRERELEASE: ${{ contains(github.ref_name, '-') }}
+
+jobs:
+  binaries:
+    name: Binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the release
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Test
+        run: |
+          go vet ./...
+          go test -race ./...
+      - name: Build the archives
+        run: scripts/dist.sh "$VERSION"
+      - name: Try the binary built for this machine
+        run: |
+          tar -xzf "dist/kasad-$VERSION-linux-amd64.tar.gz"
+          "kasad-$VERSION-linux-amd64/kasad" version | tee /dev/stderr | grep -qF "kasad $VERSION "
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes "${flags[@]}"
+
+  image:
+    name: Container image
+    # Nothing is pushed unless the tests in the job above passed.
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # to push the image
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image for this machine and try it
+        run: |
+          docker build --build-arg VERSION="$VERSION" -t kasad:try .
+          docker run --rm kasad:try version | tee /dev/stderr | grep -qF "kasad $VERSION "
+          # The image has no timezone database of its own. With TZ set, the
+          # time kasad starts by must be that zone's and not UTC. No plug
+          # answers at this address, which does not stop kasad starting.
+          docker run --rm --name kasad-try -e TZ=Pacific/Auckland -e KASAD_HOST=192.0.2.1 \
+            -e KASAD_SYNC_INTERVAL=0 kasad:try serve >start.log 2>&1 &
+          for _ in $(seq 1 30); do
+            grep -q 'serving the web app' start.log && break
+            sleep 1
+          done
+          docker stop -t 2 kasad-try >/dev/null || true
+          cat start.log
+          grep -qE 'msg=starting .* local_time=[^ ]+\+1[23]:00' start.log
+          grep -qE 'msg="serving the web app and API" addr=(\[::\]|0\.0\.0\.0):8080' start.log
+      - name: Set up a builder for several kinds of machine
+        run: docker buildx create --use
+      - name: Sign in to ghcr.io
+        if: github.ref_type == 'tag'
+        env:
+          TOKEN: ${{ github.token }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build the image for every kind of machine, and push it for a release
+        run: |
+          # ghcr.io wants the name in lower case.
+          image=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          number=${VERSION#v}
+          publish=()
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            publish+=(--push --tag "$image:$number")
+            if [ "$PRERELEASE" != true ]; then
+              # 1.2.3 is also the newest 1.2, and the newest of all.
+              publish+=(--tag "$image:${number%.*}" --tag "$image:latest")
+            fi
+          fi
+          docker buildx build \
+            --platform linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6 \
+            --build-arg VERSION="$VERSION" \
+            --label org.opencontainers.image.version="$number" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            "${publish[@]}" .

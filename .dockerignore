@@ -1,0 +1,4 @@
+# Only the Go sources go into the image's build.
+.git
+.github
+dist

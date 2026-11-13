@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -212,10 +214,66 @@ func TestHelp(t *testing.T) {
 	if got.code != exitOK {
 		t.Errorf("exit code = %d, want %d", got.code, exitOK)
 	}
-	for _, want := range []string{"Usage: kasad", "state", "sync", "-host", "-timeout", hostEnv} {
+	for _, want := range []string{
+		"Usage: kasad", "state", "sync", "version", "-host", "-timeout",
+		"[$KASAD_HOST]", "[$KASAD_TIMEOUT]", "[$KASAD_DATA]", "[$KASAD_SYNC_INTERVAL]", "[$KASAD_LISTEN]",
+		"KASAD_PASSWORD_FILE", "KASAD_TOKEN_FILE",
+	} {
 		if !strings.Contains(got.stderr, want) {
 			t.Errorf("help text does not mention %q:\n%s", want, got.stderr)
 		}
+	}
+}
+
+func TestVersion(t *testing.T) {
+	// No plug is named, and none is needed.
+	got := kasad(t, nil, "version")
+	if got.code != exitOK || got.stderr != "" {
+		t.Fatalf("exit code = %d, stderr: %s", got.code, got.stderr)
+	}
+	pattern := regexp.MustCompile(`^kasad \S+ \(go\S+, \w+/\w+\)\n$`)
+	if !pattern.MatchString(got.stdout) {
+		t.Errorf("version printed %q, want it to match %s", got.stdout, pattern)
+	}
+
+	// A release has its version built in.
+	old := version
+	version = "v9.9.9"
+	t.Cleanup(func() { version = old })
+	got = kasad(t, nil, "version")
+	if want := "kasad v9.9.9 (" + runtime.Version() + ", " + runtime.GOOS + "/" + runtime.GOARCH + ")\n"; got.stdout != want {
+		t.Errorf("version printed %q, want %q", got.stdout, want)
+	}
+}
+
+func TestFlagValuesFromTheEnvironment(t *testing.T) {
+	mock := startMock(t)
+
+	// A value from the environment is read as the flag would be, and a bad
+	// one is reported under the variable's name, before anything is sent.
+	for name, value := range map[string]string{
+		"KASAD_TIMEOUT":       "soon",
+		"KASAD_SYNC_INTERVAL": "hourly",
+	} {
+		got := kasad(t, map[string]string{hostEnv: mock.Addr(), name: value}, "state")
+		if got.code != exitUsage || !strings.Contains(got.stderr, name) || !strings.Contains(got.stderr, value) {
+			t.Errorf("%s=%s: exit code = %d, want %d and a message naming both:\n%s", name, value, got.code, exitUsage, got.stderr)
+		}
+	}
+	// The checks made of a flag's value are made of one from the environment
+	// too.
+	got := kasad(t, map[string]string{hostEnv: mock.Addr(), "KASAD_TIMEOUT": "-1s"}, "state")
+	if got.code != exitUsage || !strings.Contains(got.stderr, "-timeout must be positive") {
+		t.Errorf("KASAD_TIMEOUT=-1s: exit code = %d, stderr: %s", got.code, got.stderr)
+	}
+	if mock.Requests() != 0 {
+		t.Errorf("%d requests reached the plug, want none", mock.Requests())
+	}
+
+	// A flag on the command line wins, even over a value that is no good.
+	got = kasad(t, map[string]string{hostEnv: mock.Addr(), "KASAD_TIMEOUT": "soon"}, "-timeout", "2s", "state")
+	if got.code != exitOK {
+		t.Errorf("with -timeout given: exit code = %d, stderr: %s", got.code, got.stderr)
 	}
 }
 
