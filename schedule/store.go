@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io/fs"
 	"sync"
+
+	"github.com/gureetk/kasad/internal/atomicfile"
 )
 
 // Store holds a schedule that can be replaced while it is in use, and keeps
@@ -57,7 +59,7 @@ func (s *Store) Replace(next Schedule) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := writeFileAtomic(s.path, append(data, '\n')); err != nil {
+	if err := atomicfile.Write(s.path, append(data, '\n')); err != nil {
 		return err
 	}
 	s.current = next

@@ -347,7 +347,16 @@ signed in on that browser for 30 days, or until they sign out.
 - Signing in sets a cookie that scripts in the page cannot read and that the
   browser does not send along with requests started by other sites. The
   password itself is not kept in the browser.
-- Sessions are held in memory, so restarting kasad signs everyone out.
+- Restarting kasad does not sign anyone out. It keeps a record of who is
+  signed in, in `sessions.json` in the data directory. That file is no use
+  for signing in: for each session it holds a digest keyed with the password,
+  and when the session runs out. It does not hold the password or the
+  cookie's value, and neither can be worked out from it.
+- To sign everyone out, stop kasad, delete `sessions.json` and start it
+  again. Changing the password also does it, since a session only counts
+  under the password it began with. Those sessions would count again if the
+  old password were put back before they ran out, which deleting the file
+  rules out.
 - After five wrong passwords in a row, kasad makes the next attempt wait: a
   second at first, then twice as long each time, up to a minute. A right
   password clears the count. The count is shared by everyone, so someone on
@@ -382,10 +391,12 @@ cookie is marked for HTTPS only.
   the rules a plug stores.
 - `schedule`: rules, the calculation of when they fall due, the loop that
   applies them, and the file-backed store they are kept in.
-- `internal/api`: the JSON API.
+- `internal/api`: the JSON API, and signing in.
 - `internal/web`: the web app. `static` holds the page as it is served, with
   no build step: plain HTML, CSS and JavaScript modules.
 - `cmd/kasad`: the command-line tool.
+- `internal/atomicfile`: replaces a file in one step, for the files kasad
+  keeps in its data directory.
 - `internal/mockplug`: an in-memory mock plug, so the tests run without
   hardware.
 

@@ -1,6 +1,8 @@
 package api
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -95,5 +97,123 @@ func TestSameSecret(t *testing.T) {
 		if sameSecret("correct horse", other) {
 			t.Errorf("%q matches", other)
 		}
+	}
+}
+
+func TestSessionDigestDependsOnTheSecret(t *testing.T) {
+	one := sessions{secret: []byte("correct horse")}
+	same := sessions{secret: []byte("correct horse")}
+	other := sessions{secret: []byte("correct horse ")}
+	if one.digest("an id") != same.digest("an id") {
+		t.Error("the same id under the same secret has two digests")
+	}
+	if one.digest("an id") == other.digest("an id") {
+		t.Error("an id has the same digest under two secrets")
+	}
+	if one.digest("an id") == one.digest("an ie") {
+		t.Error("two ids have the same digest")
+	}
+}
+
+func TestSessionsSavedAndLoaded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	saved := sessions{secret: []byte("correct horse"), path: path}
+	var ids []string
+	for i := 0; i < 3; i++ {
+		id, err := saved.start(start.Add(time.Duration(i) * time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := saved.save(); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Loaded half an hour after the first of them ran out, the other two
+	// are taken up, each still due to end when it was.
+	later := start.Add(sessionLifetime + 30*time.Minute)
+	loaded := sessions{secret: []byte("correct horse"), path: path}
+	kept, err := loaded.load(later)
+	if err != nil || kept != 2 {
+		t.Fatalf("load = %d, %v; want 2 sessions and no error", kept, err)
+	}
+	for i, id := range ids {
+		if got, want := loaded.valid(id, later), i > 0; got != want {
+			t.Errorf("session %d is valid after loading = %v, want %v", i, got, want)
+		}
+	}
+	if end := later.Add(30 * time.Minute); loaded.valid(ids[1], end) || !loaded.valid(ids[2], end) {
+		t.Error("the sessions do not run out when they were due to")
+	}
+
+	// Saving the same sessions again writes the same file, whatever order
+	// the map gives them in.
+	for i := 0; i < 20; i++ {
+		again := sessions{secret: []byte("correct horse"), path: path}
+		if _, err := again.load(start); err != nil {
+			t.Fatal(err)
+		}
+		if err := again.save(); err != nil {
+			t.Fatal(err)
+		}
+		now, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(now) != string(first) {
+			t.Fatalf("saving the same sessions changed the file:\n%s\nwas:\n%s", now, first)
+		}
+	}
+}
+
+func TestLoadKeepsNoMoreThanTheLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	saved := sessions{path: path, expires: make(map[sessionDigest]time.Time)}
+	// Written by hand, as nothing kasad does makes a file this long. The
+	// later a session was added here, the later it runs out.
+	const extra = 7
+	for i := 0; i < maxSessions+extra; i++ {
+		saved.expires[sessionDigest{byte(i), byte(i >> 8)}] = start.Add(time.Duration(i+1) * time.Hour)
+	}
+	if err := saved.save(); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := sessions{path: path}
+	kept, err := loaded.load(start)
+	if err != nil || kept != maxSessions || len(loaded.expires) != maxSessions {
+		t.Fatalf("load = %d, %v, and %d sessions held; want %d", kept, err, len(loaded.expires), maxSessions)
+	}
+	for i := 0; i < maxSessions+extra; i++ {
+		if _, ok := loaded.expires[sessionDigest{byte(i), byte(i >> 8)}]; ok != (i >= extra) {
+			t.Errorf("session %d was kept = %v, want %v: the ones nearest their end go first", i, ok, i >= extra)
+		}
+	}
+}
+
+func TestSessionsWithoutAFile(t *testing.T) {
+	var s sessions
+	if _, err := s.start(start); err != nil {
+		t.Fatal(err)
+	}
+	// With nowhere to save to, saving is not attempted, so it cannot fail.
+	if err := s.save(); err != nil {
+		t.Errorf("save without a file = %v, want no error", err)
+	}
+
+	// A file that is not there holds no sessions, and that is no error.
+	missing := sessions{path: filepath.Join(t.TempDir(), "sessions.json")}
+	if kept, err := missing.load(start); kept != 0 || err != nil {
+		t.Errorf("load of a file that does not exist = %d, %v; want 0 and no error", kept, err)
+	}
+	// One that is there and cannot be read is.
+	unreadable := sessions{path: t.TempDir()}
+	if kept, err := unreadable.load(start); kept != 0 || err == nil {
+		t.Errorf("load of a directory = %d, %v; want 0 and an error", kept, err)
 	}
 }
