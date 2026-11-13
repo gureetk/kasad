@@ -1,4 +1,5 @@
-// kasad's web app: shows the plug, switches it, and edits the schedule.
+// kasad's web app: shows the plug, switches it, and edits its rules, both
+// the ones kasad runs and the ones the plug stores and runs by itself.
 //
 // The page keeps one copy of what kasad last said (state), asks again every
 // few seconds while it is on screen, and redraws from that copy.
@@ -19,10 +20,16 @@ import {
   DAYS,
   DAY_NAMES,
   PRESETS,
+  asWeeklyRule,
   cleanRule,
   describeDays,
+  describePlugRule,
+  describePlugRuleDays,
   describeRule,
   minuteOfDay,
+  nextEvent,
+  plugRuleBody,
+  plugRuleTime,
   presetOf,
   ruleLabel,
   sortDays,
@@ -31,6 +38,9 @@ import {
 
 const REFRESH_MS = 10000;
 const RETRY_MS = 5000;
+// The plug's own rules seldom change behind the page's back, and reading
+// them is one more thing to ask the plug, so they are read less often.
+const PLUG_RULES_MS = 60000;
 const MEMORY_KEY = 'kasad.plug';
 
 const byId = (id) => document.getElementById(id);
@@ -46,7 +56,13 @@ const state = {
   // at is when that answer arrived, by this device's clock (local) and by
   // kasad's (epoch and wall).
   at: null,
+  // schedule is the rules kasad runs.
   schedule: { rules: [] },
+  // plugRules is the rules the plug stores and runs by itself. known is
+  // false until they have been read once, enabled is whether the plug's
+  // schedule as a whole is switched on, problem is why the last reading
+  // failed, and at is when they were last asked for (0 to ask again now).
+  plugRules: { known: false, enabled: true, rules: [], problem: '', at: 0 },
   // memory is what this browser last saw of the plug, kept between visits.
   memory: readMemory(),
   switching: false,
@@ -67,6 +83,9 @@ let pollTimer = 0;
 function refresh(manual = false) {
   if (!loading) {
     byId('refresh').classList.toggle('is-busy', manual);
+    if (manual) {
+      state.plugRules.at = 0;
+    }
     loading = load().finally(() => {
       loading = null;
       byId('refresh').classList.remove('is-busy');
@@ -89,8 +108,33 @@ async function load() {
   const started = changes;
   try {
     const [status, schedule] = await Promise.all([api.getStatus(), api.getSchedule()]);
+
+    let plugRules = null;
+    let plugProblem = '';
+    if (status.plug.reachable && Date.now() - state.plugRules.at > PLUG_RULES_MS) {
+      try {
+        plugRules = await api.getPlugRules();
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401) {
+          throw error;
+        }
+        plugProblem = "The plug's rules could not be read just now.";
+      }
+    }
+
     if (started !== changes) {
       return 'stale';
+    }
+    if (plugRules) {
+      state.plugRules = {
+        known: true,
+        enabled: plugRules.enabled !== false,
+        rules: plugRules.rules ?? [],
+        problem: '',
+        at: Date.now(),
+      };
+    } else if (plugProblem) {
+      state.plugRules = { ...state.plugRules, problem: plugProblem, at: Date.now() };
     }
     const time = parseServerTime(status.time);
     const local = Date.now();
@@ -174,6 +218,21 @@ function plugName() {
   return livePlug()?.alias || state.memory.alias || '';
 }
 
+// plugRulesInForce is the plug's own rules that the page can place on a
+// clock, in the form of kasad's rules. Those switched off stay in the list,
+// marked as disabled. It is empty when the plug's schedule as a whole is off.
+function plugRulesInForce() {
+  if (!state.plugRules.known || !state.plugRules.enabled) {
+    return [];
+  }
+  return state.plugRules.rules.filter((rule) => rule.weekly).map(asWeeklyRule);
+}
+
+// allRules is every rule that acts on the plug by the clock, whoever runs it.
+function allRules() {
+  return [...state.schedule.rules, ...plugRulesInForce()];
+}
+
 // ---------------------------------------------------------------------------
 // Drawing
 
@@ -212,8 +271,10 @@ function render() {
   byId('token-screen').hidden = state.screen !== 'token';
   byId('app').hidden = state.screen !== 'app';
   if (state.screen !== 'app') {
-    if (editor.dialog.open) {
-      editor.dialog.close();
+    for (const dialog of [editor.dialog, sheet.dialog]) {
+      if (dialog.open) {
+        dialog.close();
+      }
     }
     return;
   }
@@ -225,6 +286,13 @@ function render() {
   renderBars();
   renderNext();
   renderRules();
+  // What a dialog allows depends on whether the plug is answering.
+  if (editor.dialog.open) {
+    renderEditor();
+  }
+  if (sheet.dialog.open) {
+    renderSheet();
+  }
 }
 
 function renderView() {
@@ -264,12 +332,13 @@ function renderHead() {
   line.classList.toggle('status--trouble', kind === 'trouble');
   setText(byId('plug-status-text'), words);
 
-  const rules = state.schedule.rules;
-  const active = rules.filter((rule) => !rule.disabled).length;
-  const count =
-    rules.length === 0
-      ? 'No rules yet'
-      : `${active} of ${rules.length} ${rules.length === 1 ? 'rule' : 'rules'} active`;
+  const own = state.schedule.rules;
+  const onPlug = state.plugRules.known ? state.plugRules.rules : [];
+  const total = own.length + onPlug.length;
+  const active =
+    own.filter((rule) => !rule.disabled).length +
+    (state.plugRules.enabled ? onPlug.filter((rule) => rule.enabled).length : 0);
+  const count = total === 0 ? 'No rules yet' : `${active} of ${total} ${total === 1 ? 'rule' : 'rules'} active`;
   setText(byId('schedule-summary'), name ? `${name} · ${count}` : count);
 
   const title = currentView() === 'schedule' ? 'Schedule · kasad' : name ? `${name} · kasad` : 'kasad';
@@ -345,13 +414,14 @@ let drawnBars = '';
 function renderBars() {
   const moment = now();
   const today = moment ? wallParts(moment.wall) : null;
-  const key = JSON.stringify([state.schedule.rules, today?.weekday, today?.minuteOfDay]);
+  const rules = allRules();
+  const key = JSON.stringify([rules, today?.weekday, today?.minuteOfDay]);
   if (key === drawnBars) {
     return;
   }
   drawnBars = key;
 
-  const plan = weekPlan(state.schedule.rules);
+  const plan = weekPlan(rules);
   const todayPlan = today ? plan[today.weekday] : { spans: [], marks: [] };
   const bar = byId('today-bar');
   drawBar(bar, todayPlan, today?.minuteOfDay);
@@ -361,7 +431,7 @@ function renderBars() {
   rows.setAttribute('role', 'img');
   rows.setAttribute(
     'aria-label',
-    'When the schedule keeps the plug on, day by day.' +
+    'When the rules keep the plug on, day by day.' +
       (today ? ` Today is ${DAY_NAMES[DAYS[today.weekday]].long}.` : ''),
   );
   rows.replaceChildren(
@@ -413,21 +483,40 @@ function renderNext() {
   const what = byId('next-what');
   const when = byId('next-when');
   const moment = now();
-  const next = state.status?.next;
-  const at = next ? parseServerTime(next.at) : null;
-  if (!moment || !at) {
-    const idle = state.link === 'starting' ? ' ' : state.schedule.rules.length > 0 ? 'Nothing coming up' : 'No rules yet';
-    setText(what, idle);
+
+  // The next thing to happen is the sooner of kasad's next event, which
+  // kasad works out, and the plug's, which is worked out here.
+  let next = null;
+  const own = state.status?.next;
+  const at = own ? parseServerTime(own.at) : null;
+  if (moment && at) {
+    next = { action: own.action, wall: at.wall, left: (at.epoch - moment.epoch) / 1000, own: true };
+  }
+  if (moment) {
+    const today = wallParts(moment.wall);
+    const onPlug = nextEvent(plugRulesInForce(), today.weekday, today.secondOfDay);
+    if (onPlug && (!next || onPlug.secondsUntil < next.left)) {
+      next = {
+        action: onPlug.action,
+        wall: moment.wall + onPlug.secondsUntil * 1000,
+        left: onPlug.secondsUntil,
+        own: false,
+      };
+    }
+  }
+
+  if (!next) {
+    const none = state.schedule.rules.length + state.plugRules.rules.length === 0;
+    setText(what, state.link === 'starting' ? '\u00a0' : none ? 'No rules yet' : 'Nothing coming up');
     setText(when, '');
     return;
   }
-  const time = formatMinute(wallParts(at.wall).minuteOfDay);
-  setText(what, `${next.action === 'off' ? 'Off' : 'On'} at ${time}${describeDay(at.wall, moment.wall)}`);
-  const left = (at.epoch - moment.epoch) / 1000;
-  setText(when, left > 0 ? `in ${formatSpan(left)}` : 'due now');
+  const time = formatMinute(wallParts(next.wall).minuteOfDay);
+  setText(what, `${next.action === 'off' ? 'Off' : 'On'} at ${time}${describeDay(next.wall, moment.wall)}`);
+  setText(when, next.left > 0 ? `in ${formatSpan(next.left)}` : 'due now');
 
-  // Once the moment has passed, find out what happened.
-  if (left < -2 && moment.elapsed > 3000) {
+  // Once kasad's moment has passed, find out what happened.
+  if (next.own && next.left < -2 && moment.elapsed > 3000) {
     refresh();
   }
 }
@@ -435,42 +524,75 @@ function renderNext() {
 let drawnRules = null;
 
 function renderRules() {
-  const rules = state.schedule.rules;
-  const key = JSON.stringify(rules);
+  const plugRules = state.plugRules;
+  const plugLive = livePlug() !== null;
+  const key = JSON.stringify([state.schedule.rules, plugRules.known, plugRules.enabled, plugRules.rules, plugRules.problem, plugLive]);
   if (key === drawnRules) {
     return;
   }
   drawnRules = key;
 
   for (const list of document.querySelectorAll('[data-rules]')) {
-    // Redrawing replaces the buttons, so put the focus back where it was.
-    const focused = list.contains(document.activeElement) ? document.activeElement : null;
-    const focusedRule = focused?.dataset.rule;
-    const focusedPart = focused?.dataset.part;
-
-    const items = rules.map(ruleItem);
+    const items = state.schedule.rules.map((rule) => ruleItem(rule, 'kasad'));
     if (items.length === 0) {
-      items.push(make('li', 'rules__empty', 'No rules yet. Add one to switch the plug at a set time.'));
+      items.push(make('li', 'rules__empty', 'No rules here yet. Add one to switch the plug at a set time.'));
     }
     items.push(addItem());
-    list.replaceChildren(...items);
+    fillList(list, items);
+  }
 
-    if (focusedPart) {
-      const again = [...list.querySelectorAll('[data-part]')].find(
-        (element) => element.dataset.part === focusedPart && element.dataset.rule === focusedRule,
-      );
-      again?.focus();
+  for (const list of document.querySelectorAll('[data-plug-rules]')) {
+    let items;
+    if (!plugRules.known) {
+      const waiting = plugLive ? "Reading the plug's rules…" : "The plug's rules can't be read while it is not answering.";
+      items = [make('li', 'rules__empty', plugRules.problem || waiting)];
+    } else if (plugRules.rules.length === 0) {
+      items = [make('li', 'rules__empty', 'The plug has no rules of its own.')];
+    } else {
+      items = plugRules.rules.map((rule) => (rule.weekly ? ruleItem(asWeeklyRule(rule), 'plug') : otherPlugRuleItem(rule)));
     }
+    fillList(list, items);
+  }
+
+  let note = '';
+  if (plugRules.known && !plugRules.enabled) {
+    note = "The plug's schedule is switched off as a whole, so none of these run.";
+  } else if (plugRules.known && plugRules.problem) {
+    note = `${plugRules.problem} This list may be out of date.`;
+  } else if (plugRules.known && !plugLive) {
+    note = 'The plug is not answering, so this list may be out of date.';
+  }
+  setText(byId('plug-rules-note'), note);
+  byId('plug-rules-note').hidden = note === '';
+}
+
+// fillList replaces what a list holds. That replaces its buttons too, so it
+// puts the focus back on the one that had it.
+function fillList(list, items) {
+  const focused = list.contains(document.activeElement) ? document.activeElement : null;
+  const focusedRule = focused?.dataset.rule;
+  const focusedPart = focused?.dataset.part;
+
+  list.replaceChildren(...items);
+
+  if (focusedPart) {
+    const again = [...list.querySelectorAll('[data-part]')].find(
+      (element) => element.dataset.part === focusedPart && element.dataset.rule === focusedRule,
+    );
+    again?.focus();
   }
 }
 
-function ruleItem(rule) {
+// ruleItem is the row for a weekly rule: one of kasad's, or one of the
+// plug's in the same form. where says which, 'kasad' or 'plug'.
+function ruleItem(rule, where) {
   const on = rule.action !== 'off';
   const item = make('li', rule.disabled ? 'rule is-paused' : 'rule');
 
   const open = make('button', 'rule__open');
   open.type = 'button';
   open.dataset.part = 'open';
+  open.dataset.where = where;
   open.dataset.rule = rule.id;
   const top = make('span', 'rule__top');
   top.append(make('span', 'rule__time', rule.time), make('span', on ? 'pill pill--on' : 'pill', on ? 'On' : 'Off'));
@@ -480,6 +602,7 @@ function ruleItem(rule) {
   const toggle = make('button', 'switch');
   toggle.type = 'button';
   toggle.dataset.part = 'switch';
+  toggle.dataset.where = where;
   toggle.dataset.rule = rule.id;
   toggle.setAttribute('role', 'switch');
   toggle.setAttribute('aria-checked', String(!rule.disabled));
@@ -490,6 +613,34 @@ function ruleItem(rule) {
   toggle.append(track);
 
   item.append(open, toggle);
+  return item;
+}
+
+// otherPlugRuleItem is the row for one of the plug's rules that is not of
+// the weekly kind. It can be looked at and deleted, but not switched or
+// changed, so it has an arrow where the others have a switch.
+function otherPlugRuleItem(rule) {
+  const on = rule.action === 'on';
+  const item = make('li', rule.enabled ? 'rule rule--plain' : 'rule rule--plain is-paused');
+
+  const open = make('button', 'rule__open');
+  open.type = 'button';
+  open.dataset.part = 'open';
+  open.dataset.where = 'plug';
+  open.dataset.rule = rule.id;
+  const top = make('span', 'rule__top');
+  const action = rule.action === 'on' ? 'On' : rule.action === 'off' ? 'Off' : '?';
+  top.append(make('span', 'rule__time', plugRuleTime(rule)), make('span', on ? 'pill pill--on' : 'pill', action));
+  const about = [rule.name, describePlugRuleDays(rule), rule.enabled ? '' : 'Turned off'].filter(Boolean);
+  const text = make('span', 'rule__text');
+  text.append(top, make('span', 'rule__about', about.join(' · ')));
+
+  const chevron = make('span', 'rule__chevron');
+  chevron.setAttribute('aria-hidden', 'true');
+  chevron.append(icon('chevron'));
+  open.append(text, chevron);
+
+  item.append(open);
   return item;
 }
 
@@ -587,13 +738,59 @@ async function toggleRule(id) {
   }
 }
 
+// changePlugRules makes one change to the plug's own rules, then reads them
+// again, since the plug is the only record of them. It resolves to '' on
+// success, or to what went wrong.
+async function changePlugRules(change) {
+  changes++;
+  let problem = '';
+  try {
+    await change();
+  } catch (error) {
+    if (unauthorized(error)) {
+      problem = 'kasad asked for a token.';
+    } else if (error instanceof ApiError) {
+      problem = `The plug did not take the change: ${error.message}`;
+    } else {
+      problem = "Can't reach kasad, so nothing was changed on the plug.";
+    }
+  }
+  changes++;
+  state.plugRules.at = 0;
+  await refreshAfterChange();
+  return problem;
+}
+
+async function togglePlugRule(id) {
+  const rule = state.plugRules.rules.find((other) => other.id === id);
+  if (!rule || !rule.weekly) {
+    return;
+  }
+  // Show the switch moved at once. Reading the rules again afterwards puts
+  // it back if the plug did not take the change.
+  const body = plugRuleBody({ ...asWeeklyRule(rule), disabled: rule.enabled });
+  state.plugRules = {
+    ...state.plugRules,
+    rules: state.plugRules.rules.map((other) => (other.id === id ? { ...other, enabled: !other.enabled } : other)),
+  };
+  render();
+  const problem = await changePlugRules(() => api.putPlugRule(id, body));
+  if (problem && state.screen === 'app') {
+    toast(problem);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The rule editor
 
 const editor = {
   dialog: byId('editor'),
+  // draft is the rule as it stands in the editor. Its "where" says who is
+  // to run it: 'kasad' or 'plug'.
   draft: null,
-  isNew: false,
+  // origin is where the rule being edited is kept now, as {where, id}, or
+  // null for a new rule.
+  origin: null,
   saving: false,
   confirmingDelete: false,
   confirmTimer: 0,
@@ -619,19 +816,27 @@ function suggestTime() {
   return formatMinute((Math.floor(minute / 15) + 1) * 15 % 1440);
 }
 
-function openEditor(id) {
-  const existing = state.schedule.rules.find((rule) => rule.id === id);
-  editor.isNew = !existing;
+// openEditor opens the editor on one of kasad's rules or one of the plug's
+// weekly rules, or on a new rule if there is none with that id.
+function openEditor(where, id) {
+  let existing = null;
+  if (where === 'plug') {
+    const rule = state.plugRules.rules.find((other) => other.id === id && other.weekly);
+    existing = rule ? asWeeklyRule(rule) : null;
+  } else {
+    existing = state.schedule.rules.find((rule) => rule.id === id) ?? null;
+  }
+  editor.origin = existing ? { where, id: existing.id } : null;
   editor.draft = existing
     ? {
-        id: existing.id,
+        where,
         name: existing.name ?? '',
         disabled: Boolean(existing.disabled),
         days: sortDays(existing.days ?? []),
         time: existing.time,
         action: existing.action === 'off' ? 'off' : 'on',
       }
-    : { id: newRuleId(), name: '', disabled: false, days: [...DAYS], time: suggestTime(), action: 'on' };
+    : { where: 'kasad', name: '', disabled: false, days: [...DAYS], time: suggestTime(), action: 'on' };
   editor.saving = false;
   endDeleteConfirmation();
   showProblem(byId('editor-error'), '');
@@ -645,9 +850,41 @@ function draftIsComplete() {
   return editor.draft.days.length > 0 && !Number.isNaN(minuteOfDay(editor.draft.time));
 }
 
+// draftNeedsThePlug reports whether saving the draft means changing
+// something on the plug: storing the rule there, or taking it off.
+function draftNeedsThePlug() {
+  return editor.draft.where === 'plug' || editor.origin?.where === 'plug';
+}
+
+function describeDraft() {
+  const draft = editor.draft;
+  const sentences = [describeRule(draft)];
+  if (!draftIsComplete()) {
+    return sentences[0];
+  }
+  sentences.push(
+    draft.where === 'plug'
+      ? 'The plug runs it by itself, by its own clock.'
+      : 'kasad runs it, so kasad has to be running.',
+  );
+  if (editor.origin && editor.origin.where !== draft.where) {
+    sentences.push(draft.where === 'plug' ? 'Saving moves it from kasad to the plug.' : 'Saving moves it from the plug to kasad.');
+  }
+  if (draftNeedsThePlug() && livePlug() === null) {
+    sentences.push('The plug is not answering, so this cannot be saved now.');
+  }
+  return sentences.join(' ');
+}
+
 function renderEditor() {
   const draft = editor.draft;
-  setText(byId('editor-title'), editor.isNew ? 'New rule' : 'Edit rule');
+  const plugLive = livePlug() !== null;
+  setText(byId('editor-title'), editor.origin ? 'Edit rule' : 'New rule');
+  for (const radio of editor.dialog.querySelectorAll('input[name="where"]')) {
+    radio.checked = radio.value === draft.where;
+    // Without the plug, a rule cannot be put on it or taken off it.
+    radio.disabled = !plugLive && radio.value !== draft.where;
+  }
   for (const radio of editor.dialog.querySelectorAll('input[name="action"]')) {
     radio.checked = radio.value === draft.action;
   }
@@ -659,10 +896,13 @@ function renderEditor() {
     button.setAttribute('aria-pressed', String(button.dataset.preset === preset));
   }
   byId('rule-active').setAttribute('aria-checked', String(!draft.disabled));
-  setText(byId('rule-summary'), describeRule(draft));
-  byId('editor-save').disabled = editor.saving || !draftIsComplete();
-  byId('rule-delete-group').hidden = editor.isNew;
-  setText(byId('rule-delete'), editor.confirmingDelete ? 'Press again to delete' : 'Delete rule');
+  setText(byId('rule-summary'), describeDraft());
+  byId('editor-save').disabled = editor.saving || !draftIsComplete() || (draftNeedsThePlug() && !plugLive);
+  byId('rule-delete-group').hidden = editor.origin === null;
+  const deleteLabel = editor.origin?.where === 'plug' ? 'Delete from the plug' : 'Delete rule';
+  const remove = byId('rule-delete');
+  setText(remove, editor.confirmingDelete ? 'Press again to delete' : deleteLabel);
+  remove.disabled = editor.saving || (editor.origin?.where === 'plug' && !plugLive);
 }
 
 function endDeleteConfirmation() {
@@ -670,26 +910,60 @@ function endDeleteConfirmation() {
   editor.confirmingDelete = false;
 }
 
+// storeDraft saves the draft where it says it should run, and takes it away
+// from where it was if that is somewhere else. A rule is stored in its new
+// place before it is removed from its old one, so a failure half way leaves
+// it in both and never in neither.
+//
+// It resolves to {problem, partial}. problem says why nothing was saved.
+// partial says what was left undone after the rule was saved.
+async function storeDraft() {
+  const { draft, origin } = editor;
+
+  if (draft.where === 'kasad') {
+    const rule = cleanRule({ ...draft, id: origin?.where === 'kasad' ? origin.id : newRuleId() });
+    const rules = state.schedule.rules.some((other) => other.id === rule.id)
+      ? state.schedule.rules.map((other) => (other.id === rule.id ? rule : other))
+      : [...state.schedule.rules, rule];
+    const problem = await saveRules(rules);
+    if (problem || origin?.where !== 'plug') {
+      return { problem, partial: '' };
+    }
+    const left = await changePlugRules(() => api.deletePlugRule(origin.id));
+    return { problem: '', partial: left && `kasad now runs the rule, but the one on the plug is still there. ${left}` };
+  }
+
+  const body = plugRuleBody(draft);
+  if (origin?.where === 'plug') {
+    return { problem: await changePlugRules(() => api.putPlugRule(origin.id, body)), partial: '' };
+  }
+  const problem = await changePlugRules(() => api.addPlugRule(body));
+  if (problem || origin?.where !== 'kasad') {
+    return { problem, partial: '' };
+  }
+  const left = await saveRules(state.schedule.rules.filter((rule) => rule.id !== origin.id));
+  return { problem: '', partial: left && `The rule is now on the plug, but kasad still has it too. ${left}` };
+}
+
 async function saveDraft() {
-  if (editor.saving || !draftIsComplete()) {
+  if (byId('editor-save').disabled) {
     return;
   }
   editor.saving = true;
   showProblem(byId('editor-error'), '');
   renderEditor();
 
-  const rule = cleanRule(editor.draft);
-  const rules = state.schedule.rules.some((other) => other.id === rule.id)
-    ? state.schedule.rules.map((other) => (other.id === rule.id ? rule : other))
-    : [...state.schedule.rules, rule];
-  const problem = await saveRules(rules);
+  const { problem, partial } = await storeDraft();
 
   editor.saving = false;
   if (problem && state.screen === 'app') {
     showProblem(byId('editor-error'), problem);
     renderEditor();
-  } else {
-    editor.dialog.close();
+    return;
+  }
+  editor.dialog.close();
+  if (partial && state.screen === 'app') {
+    toast(partial);
   }
 }
 
@@ -704,9 +978,12 @@ async function deleteDraft() {
     return;
   }
   endDeleteConfirmation();
-  const id = editor.draft.id;
+  const { where, id } = editor.origin;
   editor.dialog.close();
-  const problem = await saveRules(state.schedule.rules.filter((rule) => rule.id !== id));
+  const problem =
+    where === 'plug'
+      ? await changePlugRules(() => api.deletePlugRule(id))
+      : await saveRules(state.schedule.rules.filter((rule) => rule.id !== id));
   if (problem && state.screen === 'app') {
     toast(problem);
   }
@@ -730,8 +1007,8 @@ function wireEditor() {
   });
 
   dialog.addEventListener('change', (event) => {
-    if (event.target.name === 'action') {
-      editor.draft.action = event.target.value;
+    if (event.target.name === 'action' || event.target.name === 'where') {
+      editor.draft[event.target.name] = event.target.value;
       renderEditor();
     }
   });
@@ -760,6 +1037,102 @@ function wireEditor() {
       renderEditor();
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// The sheet for a rule on the plug that is not of the weekly kind. It shows
+// what the rule does and can delete it.
+
+const sheet = {
+  dialog: byId('plug-rule'),
+  id: null,
+  deleting: false,
+  confirmingDelete: false,
+  confirmTimer: 0,
+};
+
+function openPlugRule(id) {
+  const rule = state.plugRules.rules.find((other) => other.id === id);
+  if (!rule) {
+    return;
+  }
+  if (rule.weekly) {
+    openEditor('plug', id);
+    return;
+  }
+  sheet.id = id;
+  sheet.deleting = false;
+  endSheetConfirmation();
+  showProblem(byId('plug-rule-error'), '');
+
+  const action = rule.action === 'on' ? 'On' : rule.action === 'off' ? 'Off' : 'Not known';
+  const facts = [
+    ['Action', action],
+    ['Time', plugRuleTime(rule) === '?' ? 'Not known' : plugRuleTime(rule), true],
+    ['Repeat', describePlugRuleDays(rule)],
+  ];
+  if (rule.end) {
+    const then = rule.end.action === 'on' ? 'On' : rule.end.action === 'off' ? 'Off' : 'Something else';
+    facts.push(['Then', rule.end.at === 'time' && rule.end.time ? `${then} at ${rule.end.time}` : then]);
+  }
+  facts.push(['Name', rule.name || 'None'], ['On the plug it is', rule.enabled ? 'Turned on' : 'Turned off']);
+  byId('plug-rule-facts').replaceChildren(
+    ...facts.map(([name, value, strong]) => {
+      const row = make('div', 'group__row');
+      row.append(make('dt', '', name), make('dd', strong ? 'facts__strong' : '', value));
+      return row;
+    }),
+  );
+  setText(byId('plug-rule-summary'), `${describePlugRule(rule)} The plug runs it by itself, by its own clock.`);
+  renderSheet();
+  sheet.dialog.showModal();
+}
+
+function renderSheet() {
+  const remove = byId('plug-rule-delete');
+  setText(remove, sheet.confirmingDelete ? 'Press again to delete' : 'Delete from the plug');
+  remove.disabled = sheet.deleting || livePlug() === null;
+}
+
+function endSheetConfirmation() {
+  clearTimeout(sheet.confirmTimer);
+  sheet.confirmingDelete = false;
+}
+
+async function deleteFromSheet() {
+  if (!sheet.confirmingDelete) {
+    sheet.confirmingDelete = true;
+    sheet.confirmTimer = setTimeout(() => {
+      sheet.confirmingDelete = false;
+      renderSheet();
+    }, 4000);
+    renderSheet();
+    return;
+  }
+  endSheetConfirmation();
+  sheet.deleting = true;
+  showProblem(byId('plug-rule-error'), '');
+  renderSheet();
+  const problem = await changePlugRules(() => api.deletePlugRule(sheet.id));
+  sheet.deleting = false;
+  if (problem && state.screen === 'app') {
+    showProblem(byId('plug-rule-error'), problem);
+    renderSheet();
+    return;
+  }
+  sheet.dialog.close();
+}
+
+function wireSheet() {
+  const dialog = sheet.dialog;
+  byId('plug-rule-close').addEventListener('click', () => dialog.close());
+  byId('plug-rule-delete').addEventListener('click', deleteFromSheet);
+  dialog.addEventListener('close', endSheetConfirmation);
+  dialog.addEventListener('click', (event) => {
+    if (event.target === dialog) {
+      dialog.close();
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -816,10 +1189,15 @@ function wire() {
     if (!button) {
       return;
     }
+    const onPlug = button.dataset.where === 'plug';
     if (button.hasAttribute('data-add') || button.dataset.part === 'add') {
-      openEditor(null);
+      openEditor('kasad', null);
+    } else if (button.dataset.part === 'open' && onPlug) {
+      openPlugRule(button.dataset.rule);
     } else if (button.dataset.part === 'open') {
-      openEditor(button.dataset.rule);
+      openEditor('kasad', button.dataset.rule);
+    } else if (button.dataset.part === 'switch' && onPlug) {
+      togglePlugRule(button.dataset.rule);
     } else if (button.dataset.part === 'switch') {
       toggleRule(button.dataset.rule);
     }
@@ -854,6 +1232,7 @@ function wire() {
   }, 1000);
 
   wireEditor();
+  wireSheet();
   wireTokenScreen();
 }
 

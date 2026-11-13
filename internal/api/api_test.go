@@ -545,6 +545,170 @@ func TestDeletePlugRuleReportsAnUnreachablePlug(t *testing.T) {
 	wantStatus(t, r, http.StatusBadGateway)
 }
 
+const eveningRule = `{"name": " evening ", "days": ["mon", "fri"], "time": "18:05", "action": "on"}`
+
+func TestPostPlugRule(t *testing.T) {
+	f := newFixture(t)
+	f.mock.SetRules(plugRules...)
+
+	r := f.do("POST", "/api/plug/rules", eveningRule, nil)
+	wantStatus(t, r, http.StatusCreated)
+	fields := r.fields(t)
+	id, _ := fields["id"].(string)
+	if len(id) != 32 {
+		t.Fatalf("the new rule's id is %q:\n%s", id, r.body)
+	}
+	for field, want := range map[string]any{
+		"name": "evening", "enabled": true, "weekly": true, "repeats": true,
+		"at": "time", "time": "18:05", "action": "on",
+	} {
+		if fields[field] != want {
+			t.Errorf("%s = %v, want %v", field, fields[field], want)
+		}
+	}
+	if days, _ := fields["days"].([]any); len(days) != 2 || days[0] != "mon" || days[1] != "fri" {
+		t.Errorf("days = %v, want mon and fri", fields["days"])
+	}
+
+	rules := f.mock.Rules()
+	if len(rules) != len(plugRules)+1 {
+		t.Fatalf("the plug has %d rules, want %d", len(rules), len(plugRules)+1)
+	}
+	want := mockplug.Rule{
+		ID: id, Name: "evening", Enable: 1, Repeat: 1,
+		Weekdays: [7]int{0, 1, 0, 0, 0, 1, 0}, StartOption: 0, StartMinute: 1085, StartAction: 1, EndAction: -1,
+	}
+	if got := rules[len(rules)-1]; got != want {
+		t.Errorf("the plug stored:\n got %+v\nwant %+v", got, want)
+	}
+
+	// The schedule kasad runs is a different thing, and is not touched.
+	if own := f.store.Schedule().Rules; len(own) != 0 {
+		t.Errorf("adding a rule to the plug changed kasad's schedule: %+v", own)
+	}
+}
+
+func TestPostPlugRuleCanAddOneSwitchedOff(t *testing.T) {
+	f := newFixture(t)
+	r := f.do("POST", "/api/plug/rules", `{"enabled": false, "days": ["sun"], "time": "00:00", "action": "off"}`, nil)
+	wantStatus(t, r, http.StatusCreated)
+	rules := f.mock.Rules()
+	if len(rules) != 1 || rules[0].Enable != 0 || rules[0].Weekdays != [7]int{1, 0, 0, 0, 0, 0, 0} || rules[0].StartAction != 0 || rules[0].Name != "" {
+		t.Errorf("the plug stored: %+v", rules)
+	}
+}
+
+func TestPlugRuleRequestsMustDescribeARule(t *testing.T) {
+	f := newFixture(t)
+	f.mock.SetRules(plugRules...)
+
+	cases := map[string]string{
+		"empty object":      `{}`,
+		"not JSON":          `on at six`,
+		"no days":           `{"time": "18:05", "action": "on"}`,
+		"empty days":        `{"days": [], "time": "18:05", "action": "on"}`,
+		"an unknown day":    `{"days": ["funday"], "time": "18:05", "action": "on"}`,
+		"no time":           `{"days": ["mon"], "action": "on"}`,
+		"a time of 25:00":   `{"days": ["mon"], "time": "25:00", "action": "on"}`,
+		"no action":         `{"days": ["mon"], "time": "18:05"}`,
+		"an unknown action": `{"days": ["mon"], "time": "18:05", "action": "toggle"}`,
+		"a sunset rule":     `{"days": ["mon"], "at": "sunset", "action": "on"}`,
+		"an id in the body": `{"id": "x", "days": ["mon"], "time": "18:05", "action": "on"}`,
+	}
+	for name, body := range cases {
+		for _, request := range [][2]string{
+			{"POST", "/api/plug/rules"},
+			{"PUT", "/api/plug/rules/00000000000000000000000000000001"},
+		} {
+			r := f.do(request[0], request[1], body, map[string]string{"Content-Type": "application/json"})
+			if r.status != http.StatusBadRequest {
+				t.Errorf("%s, %s: status = %d, want 400. Body:\n%s", name, request[0], r.status, r.body)
+			}
+		}
+	}
+	rules := f.mock.Rules()
+	if len(rules) != len(plugRules) || rules[0] != plugRules[0] {
+		t.Errorf("a bad request changed the plug's rules: %+v", rules)
+	}
+
+	// Like every request with a body, these must be sent as JSON.
+	r := f.do("POST", "/api/plug/rules", eveningRule, map[string]string{"Content-Type": "text/plain"})
+	wantStatus(t, r, http.StatusUnsupportedMediaType)
+}
+
+func TestPutPlugRule(t *testing.T) {
+	f := newFixture(t)
+	f.mock.SetRules(plugRules...)
+
+	r := f.do("PUT", "/api/plug/rules/00000000000000000000000000000001",
+		`{"name": "later", "enabled": false, "days": ["sat", "sun"], "time": "09:40", "action": "off"}`, nil)
+	wantStatus(t, r, http.StatusOK)
+	fields := r.fields(t)
+	if fields["id"] != "00000000000000000000000000000001" || fields["time"] != "09:40" || fields["enabled"] != false || fields["action"] != "off" {
+		t.Errorf("PUT returned:\n%s", r.body)
+	}
+
+	rules := f.mock.Rules()
+	want := mockplug.Rule{
+		ID: "00000000000000000000000000000001", Name: "later", Enable: 0, Repeat: 1,
+		Weekdays: [7]int{1, 0, 0, 0, 0, 0, 1}, StartOption: 0, StartMinute: 580, StartAction: 0, EndAction: -1,
+	}
+	if len(rules) != len(plugRules) || rules[0] != want || rules[1] != plugRules[1] {
+		t.Errorf("the plug's rules after the change: %+v", rules)
+	}
+}
+
+func TestPutPlugRuleRefusesRulesItCannotChange(t *testing.T) {
+	f := newFixture(t)
+	f.mock.SetRules(plugRules...)
+
+	cases := []struct {
+		name, id string
+		want     int
+	}{
+		{"a rule that is not there", "no-such-rule", http.StatusNotFound},
+		{"a sunset rule", "00000000000000000000000000000002", http.StatusConflict},
+		{"a rule that runs once", "00000000000000000000000000000003", http.StatusConflict},
+	}
+	for _, tc := range cases {
+		r := f.do("PUT", "/api/plug/rules/"+tc.id, eveningRule, nil)
+		if r.status != tc.want {
+			t.Errorf("%s: status = %d, want %d. Body:\n%s", tc.name, r.status, tc.want, r.body)
+		}
+	}
+	rules := f.mock.Rules()
+	for i := range plugRules {
+		if rules[i] != plugRules[i] {
+			t.Errorf("rule %d was changed: %+v", i, rules[i])
+		}
+	}
+}
+
+func TestPlugRuleWritesReportAPlugThatDoesNotStoreThem(t *testing.T) {
+	f := newFixture(t)
+	f.mock.SetRules(plugRules...)
+	f.mock.SetForgetful(true)
+
+	for _, request := range [][2]string{
+		{"POST", "/api/plug/rules"},
+		{"PUT", "/api/plug/rules/00000000000000000000000000000001"},
+	} {
+		r := f.do(request[0], request[1], eveningRule, nil)
+		wantStatus(t, r, http.StatusBadGateway)
+		if message, _ := r.fields(t)["error"].(string); !strings.Contains(message, "did not store") {
+			t.Errorf("%s: error message %q does not say the rule was not stored", request[0], message)
+		}
+	}
+}
+
+func TestPlugRuleWritesReportAnUnreachablePlug(t *testing.T) {
+	f := newFixture(t)
+	f.mock.Close()
+
+	wantStatus(t, f.do("POST", "/api/plug/rules", eveningRule, nil), http.StatusBadGateway)
+	wantStatus(t, f.do("PUT", "/api/plug/rules/00000000000000000000000000000001", eveningRule, nil), http.StatusBadGateway)
+}
+
 func TestPlugRulesNeedTheToken(t *testing.T) {
 	f := newFixture(t)
 	f.mock.SetRules(plugRules...)
@@ -552,8 +716,10 @@ func TestPlugRulesNeedTheToken(t *testing.T) {
 
 	wantStatus(t, f.do("GET", "/api/plug/rules", "", nil), http.StatusUnauthorized)
 	wantStatus(t, f.do("DELETE", "/api/plug/rules/00000000000000000000000000000001", "", nil), http.StatusUnauthorized)
-	if left := f.mock.Rules(); len(left) != len(plugRules) {
-		t.Fatalf("a request without the token deleted a rule: %d left", len(left))
+	wantStatus(t, f.do("POST", "/api/plug/rules", eveningRule, nil), http.StatusUnauthorized)
+	wantStatus(t, f.do("PUT", "/api/plug/rules/00000000000000000000000000000001", eveningRule, nil), http.StatusUnauthorized)
+	if left := f.mock.Rules(); len(left) != len(plugRules) || left[0] != plugRules[0] {
+		t.Fatalf("a request without the token changed the plug's rules: %+v", left)
 	}
 
 	auth := map[string]string{"Authorization": "Bearer s3cret"}
@@ -625,9 +791,9 @@ func TestUnknownPathsAndMethods(t *testing.T) {
 		{"DELETE", "/api/status", http.StatusMethodNotAllowed, "GET, HEAD"},
 		{"GET", "/api/relay", http.StatusMethodNotAllowed, "POST"},
 		{"DELETE", "/api/schedule", http.StatusMethodNotAllowed, "GET, HEAD, PUT"},
-		{"DELETE", "/api/plug/rules", http.StatusMethodNotAllowed, "GET, HEAD"},
-		{"GET", "/api/plug/rules/some-rule", http.StatusMethodNotAllowed, "DELETE"},
-		{"PUT", "/api/plug/rules/some-rule", http.StatusMethodNotAllowed, "DELETE"},
+		{"DELETE", "/api/plug/rules", http.StatusMethodNotAllowed, "GET, HEAD, POST"},
+		{"GET", "/api/plug/rules/some-rule", http.StatusMethodNotAllowed, "DELETE, PUT"},
+		{"POST", "/api/plug/rules/some-rule", http.StatusMethodNotAllowed, "DELETE, PUT"},
 		{"DELETE", "/api/plug/rules/", http.StatusNotFound, ""},
 		{"DELETE", "/api/plug/rules/some-rule/more", http.StatusNotFound, ""},
 		{"GET", "/api/plug", http.StatusNotFound, ""},

@@ -34,10 +34,12 @@ export function parseServerTime(text) {
 // weekday counts from Monday as 0.
 export function wallParts(wall) {
   const date = new Date(wall);
+  const minuteOfDay = date.getUTCHours() * 60 + date.getUTCMinutes();
   return {
     day: Math.floor(wall / DAY_MS),
     weekday: (date.getUTCDay() + 6) % 7,
-    minuteOfDay: date.getUTCHours() * 60 + date.getUTCMinutes(),
+    minuteOfDay,
+    secondOfDay: minuteOfDay * 60 + date.getUTCSeconds(),
   };
 }
 

@@ -2,10 +2,16 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  asWeeklyRule,
   cleanRule,
   describeDays,
+  describePlugRule,
+  describePlugRuleDays,
   describeRule,
   minuteOfDay,
+  nextEvent,
+  plugRuleBody,
+  plugRuleTime,
   presetOf,
   ruleLabel,
   sortDays,
@@ -142,4 +148,107 @@ test('cleanRule keeps only what the API knows', () => {
     time: '09:15',
     action: 'off',
   });
+});
+
+// The plug's own rules, as the API gives them.
+const plugRule = (extra = {}) => ({
+  id: 'A1',
+  name: 'morning',
+  enabled: true,
+  weekly: true,
+  repeats: true,
+  days: ['mon', 'tue', 'wed', 'thu', 'fri'],
+  at: 'time',
+  time: '07:30',
+  action: 'on',
+  ...extra,
+});
+
+test('asWeeklyRule puts a plug rule in the form of kasad\'s own', () => {
+  assert.deepEqual(asWeeklyRule(plugRule()), {
+    id: 'A1',
+    name: 'morning',
+    disabled: false,
+    days: ['mon', 'tue', 'wed', 'thu', 'fri'],
+    time: '07:30',
+    action: 'on',
+  });
+  const off = asWeeklyRule(plugRule({ enabled: false, name: undefined, action: 'off', days: ['sun', 'sat'] }));
+  assert.deepEqual(off, { id: 'A1', name: '', disabled: true, days: ['sat', 'sun'], time: '07:30', action: 'off' });
+});
+
+test('plugRuleBody is what the API takes for a rule on the plug', () => {
+  const draft = { id: 'rule-1', name: '  Lamp ', disabled: true, days: ['sun', 'mon'], time: '18:05', action: 'off', where: 'plug' };
+  assert.deepEqual(plugRuleBody(draft), { name: 'Lamp', enabled: false, days: ['mon', 'sun'], time: '18:05', action: 'off' });
+  assert.deepEqual(plugRuleBody(rule('on', '07:00', ['thu'])), {
+    name: '',
+    enabled: true,
+    days: ['thu'],
+    time: '07:00',
+    action: 'on',
+  });
+});
+
+test('a rule goes to the plug and comes back the same', () => {
+  const draft = { id: 'x', name: 'Lamp', disabled: false, days: ['mon', 'fri'], time: '18:05', action: 'on' };
+  const stored = { id: 'B2', weekly: true, repeats: true, at: 'time', ...plugRuleBody(draft) };
+  assert.deepEqual(asWeeklyRule(stored), { ...draft, id: 'B2' });
+});
+
+test('plugRuleTime is short', () => {
+  assert.equal(plugRuleTime(plugRule()), '07:30');
+  assert.equal(plugRuleTime(plugRule({ at: 'sunrise', time: undefined })), 'Sunrise');
+  assert.equal(plugRuleTime(plugRule({ at: 'sunset', time: undefined })), 'Sunset');
+  assert.equal(plugRuleTime(plugRule({ at: 'unknown', time: undefined })), '?');
+});
+
+test('describePlugRuleDays marks a rule that runs once', () => {
+  assert.equal(describePlugRuleDays(plugRule()), 'Weekdays');
+  assert.equal(describePlugRuleDays(plugRule({ repeats: false, days: ['wed'] })), 'Once (Wed)');
+  assert.equal(describePlugRuleDays(plugRule({ days: [] })), 'No days');
+});
+
+test('describePlugRule covers the kinds kasad has no equivalent of', () => {
+  assert.equal(describePlugRule(plugRule()), 'Turns the plug on at 07:30 on weekdays.');
+  assert.equal(
+    describePlugRule(plugRule({ at: 'sunset', time: undefined, action: 'off', days: ['sat', 'sun'], enabled: false })),
+    'Turns the plug off at sunset on Saturdays and Sundays. It is switched off on the plug, so it will not run.',
+  );
+  assert.equal(
+    describePlugRule(plugRule({ repeats: false, time: '21:05', days: ['wed'], end: { at: 'time', time: '22:00', action: 'off' } })),
+    'Turns the plug on at 21:05 once. Then turns it off at 22:00.',
+  );
+  assert.equal(
+    describePlugRule(plugRule({ at: 'unknown', time: undefined, action: 'unknown', days: everyDay, end: { at: 'unknown', action: 'off' } })),
+    'Does something this page cannot read every day. Then turns it off.',
+  );
+});
+
+test('nextEvent finds the next switch, counting from now', () => {
+  const rules = [rule('on', '18:30'), rule('off', '22:15')];
+  // Wednesday 19:42:30.
+  assert.deepEqual(nextEvent(rules, 2, 19 * 3600 + 42 * 60 + 30), {
+    action: 'off',
+    minuteOfDay: 1335,
+    secondsUntil: 2 * 3600 + 32 * 60 + 30,
+  });
+  // Just after the off, the next is tomorrow's on.
+  assert.deepEqual(nextEvent(rules, 2, 22 * 3600 + 15 * 60), {
+    action: 'on',
+    minuteOfDay: 1110,
+    secondsUntil: 20 * 3600 + 15 * 60,
+  });
+});
+
+test('nextEvent wraps round the end of the week', () => {
+  const rules = [rule('on', '09:15', ['mon'])];
+  // Sunday 23:59:00: Monday 09:15 is 9 h 16 min away.
+  assert.equal(nextEvent(rules, 6, 23 * 3600 + 59 * 60).secondsUntil, 9 * 3600 + 16 * 60);
+  // Monday 09:15:00 exactly: the same rule again, a week on.
+  assert.equal(nextEvent(rules, 0, 9 * 3600 + 15 * 60).secondsUntil, 7 * 86400);
+});
+
+test('nextEvent of rules that never run is null', () => {
+  assert.equal(nextEvent([], 0, 0), null);
+  assert.equal(nextEvent([rule('on', '09:15', ['mon'], { disabled: true })], 0, 0), null);
 });

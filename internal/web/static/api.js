@@ -4,7 +4,9 @@
 // path of some other server.
 
 const TOKEN_KEY = 'kasad.token';
-const TIMEOUT_MS = 15000;
+// Storing a rule on the plug takes kasad several exchanges with it, each of
+// which may wait a while for an answer.
+const TIMEOUT_MS = 30000;
 
 // ApiError is an answer from kasad that says the request failed.
 export class ApiError extends Error {
@@ -96,3 +98,10 @@ export const getStatus = () => call('GET', 'api/status');
 export const setRelay = (on) => call('POST', 'api/relay', { on });
 export const getSchedule = () => call('GET', 'api/schedule');
 export const putSchedule = (schedule) => call('PUT', 'api/schedule', schedule);
+
+// The rules the plug stores and runs by itself.
+const plugRule = (id) => `api/plug/rules/${encodeURIComponent(id)}`;
+export const getPlugRules = () => call('GET', 'api/plug/rules');
+export const addPlugRule = (rule) => call('POST', 'api/plug/rules', rule);
+export const putPlugRule = (id, rule) => call('PUT', plugRule(id), rule);
+export const deletePlugRule = (id) => call('DELETE', plugRule(id));

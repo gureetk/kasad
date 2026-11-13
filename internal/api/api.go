@@ -1,12 +1,14 @@
 // Package api serves kasad's JSON API over HTTP.
 //
-// The API has six operations, all under /api/:
+// The API has eight operations, all under /api/:
 //
 //	GET    /api/status           the plug's state and the next scheduled event
 //	POST   /api/relay            switch the plug on or off
 //	GET    /api/schedule         the schedule kasad runs
 //	PUT    /api/schedule         replace the schedule kasad runs
 //	GET    /api/plug/rules       the rules the plug keeps and runs by itself
+//	POST   /api/plug/rules       add a rule to the plug's own
+//	PUT    /api/plug/rules/{id}  change one of the plug's own rules
 //	DELETE /api/plug/rules/{id}  delete one of the plug's own rules
 //
 // Requests and responses are JSON. An error response has the form
@@ -39,6 +41,8 @@ type Device interface {
 	Status(ctx context.Context) (plug.Status, error)
 	Switch(ctx context.Context, on bool) (plug.Sysinfo, error)
 	Rules(ctx context.Context) (plug.Rules, error)
+	AddRule(ctx context.Context, rule plug.WeeklyRule) (plug.Rule, error)
+	EditRule(ctx context.Context, id string, rule plug.WeeklyRule) (plug.Rule, error)
 	DeleteRule(ctx context.Context, id string) error
 }
 
@@ -67,7 +71,7 @@ var routes = map[string]string{
 	"/api/status":     "GET, HEAD",
 	"/api/relay":      "POST",
 	"/api/schedule":   "GET, HEAD, PUT",
-	"/api/plug/rules": "GET, HEAD",
+	"/api/plug/rules": "GET, HEAD, POST",
 }
 
 // plugRulePrefix is the path of one of the plug's own rules, less its id.
@@ -80,7 +84,7 @@ func allowedMethods(path string) (string, bool) {
 		return allowed, true
 	}
 	if id, ok := strings.CutPrefix(path, plugRulePrefix); ok && id != "" && !strings.Contains(id, "/") {
-		return "DELETE", true
+		return "DELETE, PUT", true
 	}
 	return "", false
 }
@@ -93,6 +97,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/schedule", s.getSchedule)
 	mux.HandleFunc("PUT /api/schedule", s.putSchedule)
 	mux.HandleFunc("GET /api/plug/rules", s.getPlugRules)
+	mux.HandleFunc("POST /api/plug/rules", s.postPlugRule)
+	mux.HandleFunc("PUT "+plugRulePrefix+"{id}", s.putPlugRule)
 	mux.HandleFunc("DELETE "+plugRulePrefix+"{id}", s.deletePlugRule)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		if allowed, ok := allowedMethods(r.URL.Path); ok {
@@ -397,6 +403,104 @@ func (s *Server) getPlugRules(w http.ResponseWriter, r *http.Request) {
 		response.Rules = append(response.Rules, newPlugRule(rule))
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// plugRuleRequest is the body of POST /api/plug/rules and of
+// PUT /api/plug/rules/{id}: a rule of the plain weekly kind, in the same
+// terms GET /api/plug/rules describes one.
+type plugRuleRequest struct {
+	Name string `json:"name"`
+
+	// Enabled says whether the rule is switched on. Left out, it is.
+	Enabled *bool `json:"enabled"`
+
+	Days   schedule.Days       `json:"days"`
+	Time   *schedule.TimeOfDay `json:"time"`
+	Action schedule.Action     `json:"action"`
+}
+
+// weeklyRule checks the request and turns it into a rule for the plug.
+func (request plugRuleRequest) weeklyRule() (plug.WeeklyRule, error) {
+	rule := plug.WeeklyRule{
+		Name:    strings.TrimSpace(request.Name),
+		Enabled: request.Enabled == nil || *request.Enabled,
+		Days:    [7]bool(request.Days),
+	}
+	if request.Days.Empty() {
+		return plug.WeeklyRule{}, errors.New(`the rule needs "days", with at least one day in it`)
+	}
+	if request.Time == nil {
+		return plug.WeeklyRule{}, errors.New(`the rule needs a "time", such as "07:30"`)
+	}
+	rule.Minute = request.Time.Hour*60 + request.Time.Minute
+	switch request.Action {
+	case schedule.On:
+		rule.Action = plug.RuleOn
+	case schedule.Off:
+		rule.Action = plug.RuleOff
+	default:
+		return plug.WeeklyRule{}, errors.New(`the rule needs "action": "on" or "action": "off"`)
+	}
+	return rule, nil
+}
+
+// readPlugRule decodes and checks the body of a request that carries a rule
+// for the plug. It reports false after answering the request itself.
+func readPlugRule(w http.ResponseWriter, r *http.Request) (plug.WeeklyRule, bool) {
+	var request plugRuleRequest
+	if err := decodeBody(r, &request); err != nil {
+		writeBodyError(w, err)
+		return plug.WeeklyRule{}, false
+	}
+	rule, err := request.weeklyRule()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return plug.WeeklyRule{}, false
+	}
+	return rule, true
+}
+
+// writePlugRuleError answers a request to add or change a rule on the plug
+// that failed.
+func (s *Server) writePlugRuleError(w http.ResponseWriter, doing, id string, err error) {
+	switch {
+	case errors.Is(err, plug.ErrNoSuchRule):
+		writeError(w, http.StatusNotFound, "the plug has no rule with the id "+strconv.Quote(id))
+	case errors.Is(err, plug.ErrNotWeekly):
+		writeError(w, http.StatusConflict, "that rule is of a kind that can be deleted here, but not changed")
+	default:
+		s.logger().Error("could not "+doing+" for an API request", "rule", id, "error", err)
+		writeError(w, http.StatusBadGateway, err.Error())
+	}
+}
+
+func (s *Server) postPlugRule(w http.ResponseWriter, r *http.Request) {
+	rule, ok := readPlugRule(w, r)
+	if !ok {
+		return
+	}
+	stored, err := s.Plug.AddRule(r.Context(), rule)
+	if err != nil {
+		s.writePlugRuleError(w, "add a rule to the plug", stored.ID, err)
+		return
+	}
+	s.logger().Info("added a rule to the plug for an API request", "rule", stored.ID)
+	writeJSON(w, http.StatusCreated, newPlugRule(stored))
+}
+
+func (s *Server) putPlugRule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rule, ok := readPlugRule(w, r)
+	if !ok {
+		return
+	}
+	stored, err := s.Plug.EditRule(r.Context(), id, rule)
+	if err != nil {
+		s.writePlugRuleError(w, "change a rule on the plug", id, err)
+		return
+	}
+	s.logger().Info("changed a rule on the plug for an API request", "rule", id)
+	writeJSON(w, http.StatusOK, newPlugRule(stored))
 }
 
 func (s *Server) deletePlugRule(w http.ResponseWriter, r *http.Request) {

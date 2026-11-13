@@ -4,12 +4,13 @@
 // It listens on a loopback port and speaks the same wire protocol as a real
 // device, but understands only a small set of commands: system.get_sysinfo,
 // system.set_relay_state, time.get_time, time.get_timezone, time.set_time,
-// schedule.get_rules and schedule.delete_rule.
+// schedule.get_rules, schedule.add_rule, schedule.edit_rule and
+// schedule.delete_rule.
 //
 // The field names in its replies, and the reply to an unknown method, follow
 // what real hardware sends. Every value is a placeholder. The replies to an
-// unknown module and to deleting a rule that does not exist are
-// approximations.
+// unknown module, to adding or changing a rule, and to naming a rule that
+// does not exist are approximations.
 //
 // The mock stores the rules of its schedule but does not run them: its relay
 // only moves when it is told to.
@@ -18,6 +19,7 @@ package mockplug
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -46,6 +48,8 @@ type Plug struct {
 	zoneIndex   int
 	rules       []Rule
 	scheduleOff bool
+	forgetful   bool
+	ruleIDs     int
 	requests    int
 	closed      bool
 	conns       map[net.Conn]struct{}
@@ -174,6 +178,14 @@ func (p *Plug) SetScheduleEnabled(enabled bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.scheduleOff = !enabled
+}
+
+// SetForgetful makes the plug accept new and changed rules without storing
+// them, as a device that misunderstood the request might.
+func (p *Plug) SetForgetful(forgetful bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.forgetful = forgetful
 }
 
 // Requests returns how many requests the plug has answered.
@@ -400,6 +412,30 @@ func (p *Plug) scheduleLocked(method string, args json.RawMessage) any {
 			Version: 2,
 			Enable:  enable,
 		}
+	case "add_rule":
+		rule, ok := parseRule(args)
+		if !ok {
+			return invalidArgument
+		}
+		rule.ID = p.newRuleIDLocked()
+		if !p.forgetful {
+			p.rules = append(p.rules, rule)
+		}
+		return addRuleReply{ID: rule.ID}
+	case "edit_rule":
+		rule, ok := parseRule(args)
+		if !ok {
+			return invalidArgument
+		}
+		for i := range p.rules {
+			if p.rules[i].ID == rule.ID {
+				if !p.forgetful {
+					p.rules[i] = rule
+				}
+				return status{}
+			}
+		}
+		return invalidArgument
 	case "delete_rule":
 		var params struct {
 			ID *string `json:"id"`
@@ -418,6 +454,86 @@ func (p *Plug) scheduleLocked(method string, args json.RawMessage) any {
 		return invalidArgument
 	default:
 		return methodNotSupported
+	}
+}
+
+type addRuleReply struct {
+	ID        string `json:"id"`
+	ErrorCode int    `json:"err_code"`
+}
+
+// parseRule reads the argument of add_rule or edit_rule. The mock keeps only
+// the fields it reports, and insists on the ones a rule cannot do without.
+func parseRule(args json.RawMessage) (Rule, bool) {
+	var params struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Enable      *int   `json:"enable"`
+		Repeat      *int   `json:"repeat"`
+		Weekdays    []int  `json:"wday"`
+		StartOption *int   `json:"stime_opt"`
+		StartMinute *int   `json:"smin"`
+		StartAction *int   `json:"sact"`
+		EndAction   *int   `json:"eact"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil {
+		return Rule{}, false
+	}
+	for _, field := range []*int{params.Enable, params.Repeat, params.StartOption, params.StartMinute, params.StartAction} {
+		if field == nil {
+			return Rule{}, false
+		}
+	}
+	rule := Rule{
+		ID:          params.ID,
+		Name:        params.Name,
+		Enable:      *params.Enable,
+		Repeat:      *params.Repeat,
+		StartOption: *params.StartOption,
+		StartMinute: *params.StartMinute,
+		StartAction: *params.StartAction,
+		EndAction:   -1,
+	}
+	if params.EndAction != nil {
+		rule.EndAction = *params.EndAction
+	}
+	if len(params.Weekdays) != len(rule.Weekdays) {
+		return Rule{}, false
+	}
+	for day, flag := range params.Weekdays {
+		if flag != 0 && flag != 1 {
+			return Rule{}, false
+		}
+		rule.Weekdays[day] = flag
+	}
+	switch {
+	case rule.Enable != 0 && rule.Enable != 1,
+		rule.Repeat != 0 && rule.Repeat != 1,
+		rule.StartOption < 0 || rule.StartOption > 2,
+		rule.StartMinute < 0 || rule.StartMinute >= 24*60,
+		rule.StartAction != 0 && rule.StartAction != 1,
+		rule.EndAction < -1 || rule.EndAction > 1:
+		return Rule{}, false
+	}
+	return rule, true
+}
+
+// newRuleIDLocked makes up an id for a new rule, in the form real devices
+// use. The caller holds p.mu.
+func (p *Plug) newRuleIDLocked() string {
+	for {
+		p.ruleIDs++
+		id := fmt.Sprintf("%032X", 0xA000+p.ruleIDs)
+		taken := false
+		for _, rule := range p.rules {
+			if rule.ID == id {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			return id
+		}
 	}
 }
 

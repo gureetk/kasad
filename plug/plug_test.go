@@ -526,3 +526,172 @@ func TestRulesOnAnUnreachablePlug(t *testing.T) {
 		t.Errorf("DeleteRule against a plug that is not there = %v, want a network error", err)
 	}
 }
+
+// evening is a rule to add: on at 18:05 on Mondays and Fridays.
+var evening = WeeklyRule{
+	Name: "evening", Enabled: true,
+	Days:   [7]bool{time.Monday: true, time.Friday: true},
+	Minute: 1085, Action: RuleOn,
+}
+
+func TestWeeklyRuleOnTheWire(t *testing.T) {
+	// Every field is sent, including the ones a plain weekly rule has no
+	// use for, since that is what these devices are documented to expect.
+	const want = `{"name":"evening","enable":1,"repeat":1,"wday":[0,1,0,0,0,1,0],` +
+		`"stime_opt":0,"smin":1085,"sact":1,"etime_opt":-1,"emin":0,"eact":-1,` +
+		`"year":0,"month":0,"day":0,"force":0,"longitude":0,"latitude":0}`
+	got, err := json.Marshal(evening.wire(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Errorf("add_rule argument:\n got %s\nwant %s", got, want)
+	}
+
+	off := WeeklyRule{Days: [7]bool{time.Sunday: true}, Minute: 0, Action: RuleOff}
+	got, err = json.Marshal(off.wire("AB12"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantEdit = `{"id":"AB12","name":"","enable":0,"repeat":1,"wday":[1,0,0,0,0,0,0],` +
+		`"stime_opt":0,"smin":0,"sact":0,"etime_opt":-1,"emin":0,"eact":-1,` +
+		`"year":0,"month":0,"day":0,"force":0,"longitude":0,"latitude":0}`
+	if string(got) != wantEdit {
+		t.Errorf("edit_rule argument:\n got %s\nwant %s", got, wantEdit)
+	}
+}
+
+func TestAddRule(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(testRules...)
+
+	stored, err := New(mock.Addr()).AddRule(context.Background(), evening)
+	if err != nil {
+		t.Fatalf("AddRule: %v", err)
+	}
+	want := Rule{
+		ID: stored.ID, Name: "evening", Enabled: true, Repeat: true,
+		Days: [7]bool{time.Monday: true, time.Friday: true},
+		Time: AtClockTime, Minute: 1085, Action: RuleOn,
+		EndAction: RuleNone, EndTime: NoTime,
+	}
+	if stored != want || len(stored.ID) != 32 {
+		t.Errorf("AddRule returned:\n got %+v\nwant %+v with a 32-character id", stored, want)
+	}
+
+	rules := mock.Rules()
+	if len(rules) != len(testRules)+1 {
+		t.Fatalf("the plug has %d rules, want %d", len(rules), len(testRules)+1)
+	}
+	last := rules[len(rules)-1]
+	if last.ID != stored.ID || last.Weekdays != [7]int{0, 1, 0, 0, 0, 1, 0} || last.StartMinute != 1085 || last.StartAction != 1 {
+		t.Errorf("the plug stored: %+v", last)
+	}
+}
+
+func TestAddRuleRefusesWhatIsNotARule(t *testing.T) {
+	mock := startMock(t)
+	p := New(mock.Addr())
+
+	for name, change := range map[string]func(*WeeklyRule){
+		"no days":         func(r *WeeklyRule) { r.Days = [7]bool{} },
+		"negative minute": func(r *WeeklyRule) { r.Minute = -1 },
+		"minute too late": func(r *WeeklyRule) { r.Minute = 1440 },
+		"no action":       func(r *WeeklyRule) { r.Action = RuleNone },
+	} {
+		rule := evening
+		change(&rule)
+		if _, err := p.AddRule(context.Background(), rule); err == nil {
+			t.Errorf("%s: AddRule accepted it", name)
+		}
+		if _, err := p.EditRule(context.Background(), "any", rule); err == nil {
+			t.Errorf("%s: EditRule accepted it", name)
+		}
+	}
+	if mock.Requests() != 0 {
+		t.Errorf("%d requests were sent for rules that are not valid", mock.Requests())
+	}
+}
+
+func TestAddRuleNoticesAPlugThatDoesNotStoreIt(t *testing.T) {
+	mock := startMock(t)
+	mock.SetForgetful(true)
+
+	_, err := New(mock.Addr()).AddRule(context.Background(), evening)
+	if !errors.Is(err, ErrNotStored) {
+		t.Errorf("AddRule = %v, want ErrNotStored", err)
+	}
+}
+
+func TestEditRule(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(testRules...)
+
+	// Switch the first rule off, move it and make it an "off" rule.
+	change := WeeklyRule{Name: "later", Enabled: false, Days: [7]bool{time.Sunday: true}, Minute: 600, Action: RuleOff}
+	stored, err := New(mock.Addr()).EditRule(context.Background(), testRules[0].ID, change)
+	if err != nil {
+		t.Fatalf("EditRule: %v", err)
+	}
+	want := Rule{
+		ID: testRules[0].ID, Name: "later", Enabled: false, Repeat: true,
+		Days: [7]bool{time.Sunday: true},
+		Time: AtClockTime, Minute: 600, Action: RuleOff,
+		EndAction: RuleNone, EndTime: NoTime,
+	}
+	if stored != want {
+		t.Errorf("EditRule returned:\n got %+v\nwant %+v", stored, want)
+	}
+	rules := mock.Rules()
+	if len(rules) != len(testRules) || rules[0].StartMinute != 600 || rules[0].Enable != 0 || rules[1] != testRules[1] {
+		t.Errorf("the plug's rules after the edit: %+v", rules)
+	}
+}
+
+func TestEditRuleLeavesOtherKindsAlone(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(testRules...)
+	p := New(mock.Addr())
+
+	cases := []struct {
+		name string
+		id   string
+		want error
+	}{
+		{"a rule that is not there", "no-such-rule", ErrNoSuchRule},
+		{"a sunset rule", testRules[1].ID, ErrNotWeekly},
+		{"a rule that runs once", testRules[2].ID, ErrNotWeekly},
+	}
+	for _, tc := range cases {
+		before := mock.Requests()
+		_, err := p.EditRule(context.Background(), tc.id, evening)
+		if !errors.Is(err, tc.want) {
+			t.Errorf("%s: EditRule = %v, want %v", tc.name, err, tc.want)
+		}
+		// The plug is asked what it has, and nothing more.
+		if sent := mock.Requests() - before; sent != 1 {
+			t.Errorf("%s: EditRule sent %d requests, want 1", tc.name, sent)
+		}
+	}
+	rules := mock.Rules()
+	for i := range testRules {
+		if rules[i] != testRules[i] {
+			t.Errorf("rule %d was changed: %+v", i, rules[i])
+		}
+	}
+}
+
+func TestEditRuleNoticesAPlugThatDoesNotStoreIt(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(testRules...)
+	mock.SetForgetful(true)
+
+	stored, err := New(mock.Addr()).EditRule(context.Background(), testRules[0].ID, evening)
+	if !errors.Is(err, ErrNotStored) {
+		t.Errorf("EditRule = %v, want ErrNotStored", err)
+	}
+	// What the plug does hold comes back with the error.
+	if stored.ID != testRules[0].ID || stored.Minute != 450 {
+		t.Errorf("EditRule returned %+v alongside the error, want the rule as the plug has it", stored)
+	}
+}

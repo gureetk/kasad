@@ -12,8 +12,8 @@ Early. What works today:
 - switch the relay on and off
 - set the plug's clock from the machine kasad runs on
 - run a weekly on/off schedule, as a long-running service
-- list and delete the rules stored on the plug itself
-- offer a web app for switching the plug and editing the schedule
+- list, add, change and delete the rules stored on the plug itself
+- offer a web app for switching the plug and editing both kinds of rule
 - offer a JSON API for the plug and the schedule
 
 ## Build
@@ -137,14 +137,43 @@ kasad -host 192.0.2.10 delete-rule 00000000000000000000000000000001
 A deleted rule cannot be brought back. kasad asks the plug what rules it has
 first, and only ever asks it to delete one of those.
 
-kasad can list and delete these rules, but not yet add or change them. Two
-things are worth knowing:
+The web app and the API go further than these two commands. They can add a
+rule to the plug and change one, for rules of the plain weekly kind: on or
+off at a time of day, on chosen days of every week. In the web app each rule
+says whether it runs on kasad or on the plug, and changing that moves it.
 
-- Deleting has so far only been tried against the mock plug that the tests
-  use, not against hardware.
-- The plug gives a rule's days as seven flags. kasad reads them as starting
-  on Sunday, which is how other clients for these plugs read them, but that
-  has not been checked against a plug holding a rule for only some days.
+Which to use for a rule:
+
+| | Run by kasad | Stored on the plug |
+|---|---|---|
+| Works while kasad is not running | No | Yes |
+| Depends on the plug's clock | No | Yes |
+| Retried, and caught up after an outage | Yes | No |
+
+How kasad treats the plug's rules:
+
+- **It checks what the plug stored.** After adding or changing a rule, kasad
+  reads the plug's rules back and reports a failure if the rule is not there
+  as it was sent.
+- **It only names rules the plug has listed.** Before changing or deleting a
+  rule, kasad asks the plug what rules it has.
+- **Moving is add, then delete.** A rule is stored in its new place before it
+  is removed from its old one. If the second step fails, the rule is in both
+  places, where it can be seen, and never in neither.
+- **Other kinds of rule are left as they are.** A rule timed by sunrise or
+  sunset, one that runs once, or one with a second action is listed and can
+  be deleted, but not changed.
+- **The plug's schedule has a switch of its own.** If it is off, none of the
+  plug's rules run. kasad reports that, and does not change it.
+
+Two things are worth knowing:
+
+- Adding, changing and deleting have so far only been tried against the mock
+  plug that the tests use, not against hardware. The requests follow
+  published notes on the protocol for older models of plug.
+- The plug gives a rule's days as seven flags. kasad reads and writes them as
+  starting on Sunday, which is how other clients for these plugs treat them,
+  but that has not been checked against a plug.
 
 ### The plug's clock
 
@@ -173,9 +202,11 @@ kasad -host 192.0.2.10 -data /var/lib/kasad -listen 127.0.0.1:8080 serve
 ```
 
 Open `http://127.0.0.1:8080/` in a browser. The page shows whether the plug
-is on and switches it, shows when the schedule will next act, and adds, edits,
-pauses and deletes rules. It lays itself out for a phone or a desktop, and
-follows the device's light or dark setting.
+is on and switches it, shows when a rule will next act, and adds, edits,
+pauses and deletes rules. It lists the rules kasad runs and the rules stored
+on the plug side by side, and a rule can be moved from one to the other. It
+lays itself out for a phone or a desktop, and follows the device's light or
+dark setting.
 
 Things to know:
 
@@ -187,6 +218,10 @@ Things to know:
   is in.
 - **It asks the plug often.** While the page is open and on screen it
   refreshes every 10 seconds, and each refresh asks the plug for its state.
+  It reads the rules stored on the plug once a minute.
+- **The chart shows both kinds of rule.** The bars for today and the week,
+  and the next event, take in the rules kasad runs and the weekly rules stored
+  on the plug.
 - **Installing it.** The page has what a browser needs to install it as an
   app. Browsers generally only offer that for pages served over HTTPS or from
   `localhost`, so over plain HTTP on a LAN it is an ordinary page that can be
@@ -204,6 +239,8 @@ programs can use too:
 | `GET /api/schedule` | The schedule kasad runs, in the same form as `schedule.json` |
 | `PUT /api/schedule` | Replace the whole schedule kasad runs |
 | `GET /api/plug/rules` | The rules stored on the plug, which it runs by itself |
+| `POST /api/plug/rules` | Add a rule to the plug |
+| `PUT /api/plug/rules/{id}` | Change one of the rules stored on the plug |
 | `DELETE /api/plug/rules/{id}` | Delete one of the rules stored on the plug |
 
 ```
@@ -211,12 +248,14 @@ curl http://127.0.0.1:8080/api/status
 curl -X POST -H 'Content-Type: application/json' -d '{"on": true}' http://127.0.0.1:8080/api/relay
 curl -X PUT -H 'Content-Type: application/json' --data @schedule.json http://127.0.0.1:8080/api/schedule
 curl http://127.0.0.1:8080/api/plug/rules
+curl -X POST -H 'Content-Type: application/json' -d '{"days": ["mon", "fri"], "time": "07:30", "action": "on"}' http://127.0.0.1:8080/api/plug/rules
 curl -X DELETE http://127.0.0.1:8080/api/plug/rules/00000000000000000000000000000001
 ```
 
 Responses are JSON. An error has the form `{"error": "..."}` with a fitting
 status code: 400 for a request that is wrong, 404 for a rule the plug does
-not have, 502 when the plug could not be reached or did not do as asked.
+not have, 409 for a rule of a kind that cannot be changed, 502 when the plug
+could not be reached or did not do as asked.
 `GET /api/status` still answers 200 when the plug is unreachable, with
 `"reachable": false`, because the rest of the answer does not depend on the
 plug.
@@ -254,7 +293,24 @@ A `POST` or `PUT` must be sent as `application/json`.
   `time` and `action`.
 - `weekly` is true for the plain kind of rule, which switches the plug at a
   time of day on chosen days of every week and does nothing else. That is the
-  kind the schedule kasad runs is made of.
+  kind the schedule kasad runs is made of, and the only kind that can be
+  added or changed.
+
+`POST /api/plug/rules` and `PUT /api/plug/rules/{id}` take a weekly rule in
+the same terms, and answer with the rule as the plug then lists it:
+
+```json
+{
+  "name": "morning",
+  "enabled": true,
+  "days": ["mon", "tue", "wed", "thu", "fri"],
+  "time": "07:30",
+  "action": "on"
+}
+```
+
+`name` and `enabled` may be left out; a rule is enabled unless it says
+otherwise. The plug chooses the id of a new rule.
 
 ### Who can use the web app and API
 

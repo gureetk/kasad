@@ -285,8 +285,10 @@ button:disabled {
   order: 2;
 }
 
-.columns .rules,
-.columns .hint {
+.columns .rulegroup,
+.columns .beside,
+.columns > .hint,
+.column > .hint {
   order: 3;
 }
 
@@ -788,8 +790,22 @@ button:disabled {
 
 /* Rules */
 
-.rules--beside {
+.beside {
   display: none;
+}
+
+.rulegroup {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rulegroup > .eyebrow {
+  margin: 4px 4px 0;
+}
+
+.rulegroup > .hint {
+  margin-top: 0;
 }
 
 .rule {
@@ -898,6 +914,38 @@ button:disabled {
   background: var(--sage);
 }
 
+/* A rule that can be opened but not switched has an arrow, not a switch. */
+
+.rule--plain {
+  padding-right: 0;
+}
+
+.rule--plain .rule__open {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-right: 14px;
+  border-radius: 20px;
+}
+
+.rule__text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.rule__chevron {
+  flex: none;
+  display: flex;
+  color: var(--ink-2);
+}
+
+.rule__chevron .icon {
+  stroke-width: 2;
+}
+
 .rules__empty {
   padding: 18px 16px;
   font-size: 15px;
@@ -964,7 +1012,7 @@ button:disabled {
 
 .sheet__head {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
   padding: 6px 12px;
 }
@@ -1120,6 +1168,14 @@ button:disabled {
   display: block;
 }
 
+.segments__option input:disabled + .segments__face {
+  opacity: 0.5;
+}
+
+.segments__option input:disabled {
+  cursor: default;
+}
+
 .segments__option input:focus-visible + .segments__face {
   outline: 2px solid var(--sage-ink);
   outline-offset: 2px;
@@ -1186,6 +1242,43 @@ button:disabled {
 
 .hint--tight {
   margin-top: -6px;
+}
+
+.facts {
+  margin: 0;
+}
+
+.facts dt {
+  font-size: 16px;
+}
+
+.facts dd {
+  margin: 0;
+  color: var(--ink-2);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.facts .facts__strong {
+  color: var(--ink);
+  font-size: 17px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.notice {
+  display: flex;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--hairline);
+  border-radius: 16px;
+  background: var(--track);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.notice .icon {
+  margin-top: 1px;
 }
 
 .sheet .problem {
@@ -1478,8 +1571,9 @@ button:disabled {
 
   .columns .today,
   .columns .rows,
-  .columns .rules,
-  .columns .hint {
+  .columns .rulegroup,
+  .columns .beside,
+  .column > .hint {
     order: 0;
   }
 
@@ -1516,8 +1610,10 @@ button:disabled {
     margin-bottom: 0;
   }
 
-  .rules--beside {
-    display: block;
+  .beside {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
   }
 
   .toast {

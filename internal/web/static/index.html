@@ -30,6 +30,7 @@
 <symbol id="i-warning" viewBox="0 0 24 24"><path d="M12 4.5l8.5 14.5h-17L12 4.5z"/><path d="M12 10.5v4"/><path d="M12 17v.2"/></symbol>
 <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/></symbol>
 <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5"/><path d="M12 7.6v.2"/></symbol>
 </svg>
 
 <noscript><p class="noscript">This page needs JavaScript to talk to kasad.</p></noscript>
@@ -138,9 +139,16 @@
 </div>
 </section>
 
-<section class="card rules rules--beside" aria-label="Rules">
-<ul class="rules__list" data-rules></ul>
+<div class="beside">
+<section class="rulegroup" aria-labelledby="beside-own-title">
+<h2 id="beside-own-title" class="eyebrow">Run by kasad</h2>
+<div class="card rules"><ul class="rules__list" data-rules></ul></div>
 </section>
+<section class="rulegroup" aria-labelledby="beside-plug-title">
+<h2 id="beside-plug-title" class="eyebrow">Stored on the plug</h2>
+<div class="card rules"><ul class="rules__list" data-plug-rules></ul></div>
+</section>
+</div>
 
 </div>
 </div>
@@ -169,11 +177,18 @@
 </div>
 <div class="column">
 
-<section class="card rules" aria-label="Rules">
-<ul class="rules__list" data-rules></ul>
+<section class="rulegroup" aria-labelledby="own-rules-title">
+<h2 id="own-rules-title" class="eyebrow">Run by kasad</h2>
+<div class="card rules"><ul class="rules__list" data-rules></ul></div>
 </section>
 
-<p class="hint">Rules run on kasad, by its own clock. They need neither the internet nor the plug's clock.</p>
+<section class="rulegroup" aria-labelledby="plug-rules-title">
+<h2 id="plug-rules-title" class="eyebrow">Stored on the plug</h2>
+<div class="card rules"><ul class="rules__list" data-plug-rules></ul></div>
+<p id="plug-rules-note" class="hint" hidden></p>
+</section>
+
+<p class="hint">kasad runs its rules by its own clock, so it has to be running. The plug runs the rules stored on it by itself, by its own clock, whether or not kasad is running.</p>
 
 </div>
 </div>
@@ -194,6 +209,13 @@
 <div class="sheet__body">
 
 <div class="group">
+<div class="group__row group__row--tall">
+<span id="where-label">Runs on</span>
+<div class="segments" role="radiogroup" aria-labelledby="where-label">
+<label class="segments__option"><input type="radio" name="where" value="kasad"><span class="segments__face">kasad</span></label>
+<label class="segments__option"><input type="radio" name="where" value="plug"><span class="segments__face">Plug</span></label>
+</div>
+</div>
 <div class="group__row group__row--tall">
 <span id="action-label">Action</span>
 <div class="segments" role="radiogroup" aria-labelledby="action-label">
@@ -247,6 +269,36 @@
 
 </div>
 </form>
+</dialog>
+
+<dialog id="plug-rule" class="sheet" aria-labelledby="plug-rule-title">
+<div class="sheet__form">
+<span class="sheet__grabber" aria-hidden="true"></span>
+<header class="sheet__head">
+<button type="button" id="plug-rule-close" class="plain">Close</button>
+<h2 id="plug-rule-title">Rule on the plug</h2>
+<span aria-hidden="true"></span>
+</header>
+
+<div class="sheet__body">
+
+<dl id="plug-rule-facts" class="group facts"></dl>
+
+<p id="plug-rule-summary" class="hint hint--tight"></p>
+
+<div class="notice">
+<svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>
+<p>This kind of rule can't be changed from here. It can be deleted, and a rule that goes by the clock can take its place.</p>
+</div>
+
+<p id="plug-rule-error" class="problem" role="alert" hidden></p>
+
+<div class="group">
+<button type="button" id="plug-rule-delete" class="group__action group__action--danger">Delete from the plug</button>
+</div>
+
+</div>
+</div>
 </dialog>
 
 <p id="toast" class="toast" role="status" aria-live="polite" hidden></p>

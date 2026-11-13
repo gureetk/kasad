@@ -130,6 +130,15 @@ func (s *serving) waitFor(what string, ok func() bool) {
 // waitForLog waits until the log contains text. The plug changes state a
 // moment before serve records that a rule was applied, so tests that go on to
 // stop serve wait for the record, not just for the plug.
+// waitForApplied waits for serve to say it has applied the rule with the
+// given id, which it does once the plug has confirmed the switch and the
+// progress is saved. The rule's id alone is not enough to wait for, since
+// serve also names the next rule when it starts.
+func (s *serving) waitForApplied(id string) {
+	s.t.Helper()
+	s.waitForLog(`msg="applied rule" rule=` + id + " ")
+}
+
 func (s *serving) waitForLog(text string) {
 	s.t.Helper()
 	s.waitFor("the log to contain "+text, func() bool {
@@ -190,11 +199,11 @@ func TestServeAppliesRulesAsTheyFallDue(t *testing.T) {
 
 	s.clock.Set(at(4, 6))
 	s.waitFor("the plug to be switched on", mock.RelayOn)
-	s.waitForLog("rule=soon-on")
+	s.waitForApplied("soon-on")
 
 	s.clock.Set(at(4, 10))
 	s.waitFor("the plug to be switched off", func() bool { return !mock.RelayOn() })
-	s.waitForLog("rule=soon-off")
+	s.waitForApplied("soon-off")
 
 	if code := s.stop(); code != exitOK {
 		t.Errorf("exit code = %d, want %d. Log:\n%s", code, exitOK, s.stderr.String())
@@ -225,7 +234,7 @@ func TestServeCatchesUpAfterDowntime(t *testing.T) {
 
 	s := startServe(t, mock, dir, "-sync-interval", "0")
 	s.waitFor("the missed rule to be applied", mock.RelayOn)
-	s.waitForLog("rule=missed")
+	s.waitForApplied("missed")
 	s.stop()
 
 	if state := readState(t, dir); !state.Since.Equal(at(4, 0)) {
@@ -471,7 +480,7 @@ func TestServeAPIScheduleChangeNeedsNoRestart(t *testing.T) {
 
 	s.clock.Set(at(4, 6))
 	s.waitFor("the plug to be switched on", mock.RelayOn)
-	s.waitForLog("rule=soon-on")
+	s.waitForApplied("soon-on")
 	s.stop()
 
 	saved, err := schedule.Load(filepath.Join(dir, scheduleFile))
