@@ -29,7 +29,7 @@ func (f *fakeTime) Now() time.Time {
 	return f.now
 }
 
-func (f *fakeTime) Sleep(ctx context.Context, d time.Duration) error {
+func (f *fakeTime) Sleep(ctx context.Context, d time.Duration, _ <-chan struct{}) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -89,6 +89,12 @@ func newHarness(t *testing.T, start time.Time) *harness {
 
 // run runs the schedule from the clock's current time until end.
 func (h *harness) run(s Schedule, end time.Time) {
+	h.t.Helper()
+	h.runFunc(Static(s), end)
+}
+
+// runFunc is run for a schedule that may change as the clock moves.
+func (h *harness) runFunc(s func() Schedule, end time.Time) {
 	h.t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -313,7 +319,7 @@ func TestRunnerWithoutAStateStore(t *testing.T) {
 	}
 	var got []string
 	runner := &Runner{
-		Schedule: eveningSchedule(),
+		Schedule: Static(eveningSchedule()),
 		Now:      clock.Now,
 		sleep:    clock.Sleep,
 		Apply: func(_ context.Context, event Event) error {
@@ -333,7 +339,7 @@ func TestRunnerStopsWhenTheContextEnds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	runner := &Runner{
-		Schedule: eveningSchedule(),
+		Schedule: Static(eveningSchedule()),
 		Apply:    func(context.Context, Event) error { return nil },
 	}
 	go func() { done <- runner.Run(ctx) }()
@@ -350,9 +356,72 @@ func TestRunnerStopsWhenTheContextEnds(t *testing.T) {
 }
 
 func TestRunnerNeedsAnApplyFunction(t *testing.T) {
-	runner := &Runner{Schedule: eveningSchedule()}
+	runner := &Runner{Schedule: Static(eveningSchedule())}
 	if err := runner.Run(context.Background()); !errors.Is(err, ErrNoApply) {
 		t.Errorf("Run without Apply = %v, want ErrNoApply", err)
+	}
+}
+
+func TestRunnerNeedsAScheduleFunction(t *testing.T) {
+	runner := &Runner{Apply: func(context.Context, Event) error { return nil }}
+	if err := runner.Run(context.Background()); !errors.Is(err, ErrNoSchedule) {
+		t.Errorf("Run without Schedule = %v, want ErrNoSchedule", err)
+	}
+}
+
+func TestRunnerFollowsAScheduleThatChangesWhileItRuns(t *testing.T) {
+	loc := newYork(t)
+	h := newHarness(t, time.Date(2026, time.January, 14, 18, 0, 0, 0, loc))
+
+	// At 19:00 the schedule is replaced. The new one has a rule at 18:45,
+	// which has already passed, and one at 20:00.
+	changeAt := time.Date(2026, time.January, 14, 19, 0, 0, 0, loc)
+	replacement := Schedule{Rules: []Rule{
+		{ID: "already-past", Days: EveryDay(), Time: TimeOfDay{18, 45}, Action: Off},
+		{ID: "still-to-come", Days: EveryDay(), Time: TimeOfDay{20, 0}, Action: Off},
+	}}
+	current := func() Schedule {
+		if h.clock.Now().Before(changeAt) {
+			return eveningSchedule()
+		}
+		return replacement
+	}
+	h.runFunc(current, time.Date(2026, time.January, 14, 23, 0, 0, 0, loc))
+
+	// The old schedule's 18:30 rule fires. After the change, the rule that
+	// had already passed is not applied late, the one still to come is, and
+	// the old schedule's 22:15 rule is gone.
+	h.wantApplied("on@01-14 18:30", "still-to-come@01-14 20:00")
+	if got := strings.Count(h.log.String(), "starting from now"); got != 2 {
+		t.Errorf("the log mentions starting from now %d times, want twice (first start and the change):\n%s", got, h.log.String())
+	}
+	if h.state.state.Digest != replacement.Digest() {
+		t.Error("the saved state does not carry the new schedule's digest")
+	}
+}
+
+func TestSleepContext(t *testing.T) {
+	// A pending wake-up ends the sleep at once.
+	wake := make(chan struct{}, 1)
+	wake <- struct{}{}
+	start := time.Now()
+	if err := sleepContext(context.Background(), time.Hour, wake); err != nil {
+		t.Errorf("sleep ended by a wake-up returned %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("sleep took %v to notice a wake-up", elapsed)
+	}
+
+	// With no wake channel, the timer ends it.
+	if err := sleepContext(context.Background(), time.Millisecond, nil); err != nil {
+		t.Errorf("sleep ended by its timer returned %v", err)
+	}
+
+	// The end of the context ends it with an error.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sleepContext(ctx, time.Hour, nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("sleep ended by its context returned %v, want context.Canceled", err)
 	}
 }
 
@@ -364,7 +433,7 @@ func (brokenState) Save(State) error     { return nil }
 
 func TestRunnerReportsUnreadableState(t *testing.T) {
 	runner := &Runner{
-		Schedule: eveningSchedule(),
+		Schedule: Static(eveningSchedule()),
 		State:    brokenState{},
 		Apply:    func(context.Context, Event) error { return nil },
 	}

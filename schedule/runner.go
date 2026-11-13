@@ -21,19 +21,33 @@ const (
 	DefaultRetryInterval = 30 * time.Second
 )
 
+// Errors returned by Run for a Runner that is not set up.
+var (
+	ErrNoSchedule = errors.New("schedule: runner has no Schedule function")
+	ErrNoApply    = errors.New("schedule: runner has no Apply function")
+)
+
 // Runner applies a schedule's events as they fall due.
 //
 // When it starts, it catches up: if events fell due while it was not
 // running, it applies the most recent one. Earlier ones are skipped, since
-// the latest decides what state the plug should be in. If the schedule is
-// new or has changed since the last run, there is nothing to catch up on and
-// the Runner starts from the present.
+// the latest decides what state the plug should be in.
+//
+// A schedule that is new, or that has changed, takes effect from the moment
+// the Runner sees it. Events it would have had before then are not applied.
+// That holds whether the change happened between runs or during one.
 //
 // An event that cannot be applied is retried until it succeeds or a later
 // event takes its place.
 type Runner struct {
-	// Schedule is the schedule to run.
-	Schedule Schedule
+	// Schedule returns the schedule to run. It is called on every pass, so
+	// the schedule may change while the Runner is running.
+	Schedule func() Schedule
+
+	// Wake, if not nil, makes the Runner look at the schedule straight
+	// away instead of at its next check. Send on it after changing what
+	// Schedule returns.
+	Wake <-chan struct{}
 
 	// Apply carries out an event. It is retried if it returns an error.
 	Apply func(ctx context.Context, event Event) error
@@ -54,14 +68,21 @@ type Runner struct {
 	CheckInterval time.Duration
 	RetryInterval time.Duration
 
-	// sleep waits for d or until ctx ends. Tests replace it.
-	sleep func(ctx context.Context, d time.Duration) error
+	// sleep waits for d, a wake-up, or the end of ctx. Tests replace it.
+	sleep func(ctx context.Context, d time.Duration, wake <-chan struct{}) error
+}
+
+// Static returns a Schedule function for a schedule that never changes.
+func Static(s Schedule) func() Schedule {
+	return func() Schedule { return s }
 }
 
 // Run applies events until ctx ends, then returns nil. It returns an error
-// only if the Runner has no Apply function or the saved state cannot be
-// read.
+// only if the Runner is not set up or the saved state cannot be read.
 func (r *Runner) Run(ctx context.Context) error {
+	if r.Schedule == nil {
+		return ErrNoSchedule
+	}
 	if r.Apply == nil {
 		return ErrNoApply
 	}
@@ -103,18 +124,20 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 		state = loaded
 	}
-	digest := r.Schedule.Digest()
-	if state.Since.IsZero() || state.Digest != digest {
-		// A new or changed schedule takes effect from now on. Events it
-		// would have had in the past are not applied.
-		state = State{Since: now(), Digest: digest}
-		save(state)
-		logger.Info("schedule is new or has changed, starting from now")
-	}
 
 	failing := false
 	for {
+		rules := r.Schedule()
 		current := now()
+
+		if digest := rules.Digest(); state.Since.IsZero() || state.Digest != digest {
+			// A new or changed schedule takes effect from now on. Events it
+			// would have had in the past are not applied.
+			state = State{Since: current, Digest: digest}
+			save(state)
+			logger.Info("schedule is new or has changed, starting from now")
+			failing = false
+		}
 		if state.Since.After(current) {
 			// The clock has gone backwards past the saved point. Without
 			// this, nothing would fire until the clock caught up again.
@@ -124,7 +147,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 
 		wait := checkInterval
-		if event, ok := r.Schedule.Due(state.Since, current); ok {
+		if event, ok := rules.Due(state.Since, current); ok {
 			err := r.Apply(ctx, event)
 			switch {
 			case err == nil:
@@ -147,29 +170,28 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 		}
 
-		if next, ok := r.Schedule.Next(current); ok {
+		if next, ok := rules.Next(current); ok {
 			if until := next.At.Sub(current); until < wait {
 				wait = until
 			}
 		}
-		if err := sleep(ctx, wait); err != nil {
+		if err := sleep(ctx, wait, r.Wake); err != nil {
 			return nil
 		}
 	}
 }
 
-// sleepContext waits for d, or until ctx ends, in which case it returns
-// ctx's error.
-func sleepContext(ctx context.Context, d time.Duration) error {
+// sleepContext waits for d or for a wake-up, whichever comes first. If ctx
+// ends before either, it returns ctx's error. A nil wake channel never wakes.
+func sleepContext(ctx context.Context, d time.Duration, wake <-chan struct{}) error {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
 		return nil
+	case <-wake:
+		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
-
-// ErrNoApply is returned by Run when the Runner has no Apply function.
-var ErrNoApply = errors.New("schedule: runner has no Apply function")

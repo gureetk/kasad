@@ -2,8 +2,14 @@ package plug
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 )
+
+// ErrNotSwitched is returned by Switch when the device accepts the command
+// but its relay does not change.
+var ErrNotSwitched = errors.New("device accepted the command but did not switch")
 
 // Sysinfo is the device's description of itself and its current state.
 type Sysinfo struct {
@@ -121,6 +127,29 @@ func (p *Plug) SetRelay(ctx context.Context, on bool) error {
 		method: "set_relay_state",
 		params: map[string]int{"state": state},
 	})
+}
+
+// Switch turns the relay on or off, then reads the state back to confirm that
+// the device did it. It returns the state it read.
+func (p *Plug) Switch(ctx context.Context, on bool) (Sysinfo, error) {
+	if err := p.SetRelay(ctx, on); err != nil {
+		return Sysinfo{}, err
+	}
+	info, err := p.Sysinfo(ctx)
+	if err != nil {
+		return Sysinfo{}, fmt.Errorf("plug: sent the command, but could not confirm the new state: %w", err)
+	}
+	if info.On() != on {
+		return info, fmt.Errorf("plug: %w: asked for %s, still %s", ErrNotSwitched, onOff(on), onOff(info.On()))
+	}
+	return info, nil
+}
+
+func onOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
 }
 
 // Clock reads the device's date, time and timezone setting.

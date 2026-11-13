@@ -55,9 +55,13 @@ func (f StateFile) Save(state State) error {
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
+	return writeFileAtomic(f.Path, append(data, '\n'))
+}
 
-	temp, err := os.CreateTemp(filepath.Dir(f.Path), filepath.Base(f.Path)+".tmp-*")
+// writeFileAtomic replaces the file at path with data in one step: it writes
+// a temporary file beside it and renames that into place.
+func writeFileAtomic(path string, data []byte) error {
+	temp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
@@ -74,5 +78,5 @@ func (f StateFile) Save(state State) error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temp.Name(), f.Path)
+	return os.Rename(temp.Name(), path)
 }
