@@ -210,6 +210,9 @@ dark setting.
 
 Things to know:
 
+- **It can ask people to sign in.** Start `serve` with `KASAD_PASSWORD` set
+  and the page asks for that password first. See "Who can use the web app and
+  API" below.
 - **It is part of the binary.** The page is a few static files compiled into
   kasad. It loads nothing from anywhere else, so it works on a network with no
   internet. It does need kasad: there is nothing for it to show offline.
@@ -242,6 +245,9 @@ programs can use too:
 | `POST /api/plug/rules` | Add a rule to the plug |
 | `PUT /api/plug/rules/{id}` | Change one of the rules stored on the plug |
 | `DELETE /api/plug/rules/{id}` | Delete one of the rules stored on the plug |
+| `GET /api/session` | Whether signing in is required, possible and done |
+| `POST /api/session` | Sign in: send `{"password": "..."}` |
+| `DELETE /api/session` | Sign out |
 
 ```
 curl http://127.0.0.1:8080/api/status
@@ -253,9 +259,11 @@ curl -X DELETE http://127.0.0.1:8080/api/plug/rules/0000000000000000000000000000
 ```
 
 Responses are JSON. An error has the form `{"error": "..."}` with a fitting
-status code: 400 for a request that is wrong, 404 for a rule the plug does
-not have, 409 for a rule of a kind that cannot be changed, 502 when the plug
-could not be reached or did not do as asked.
+status code: 400 for a request that is wrong, 401 for one that has to sign
+in or send the token first, 404 for a rule the plug does not have, 409 for a
+rule of a kind that cannot be changed, 429 for a password tried too soon
+after wrong ones, 502 when the plug could not be reached or did not do as
+asked.
 `GET /api/status` still answers 200 when the plug is unreachable, with
 `"reachable": false`, because the rest of the answer does not depend on the
 plug.
@@ -315,24 +323,56 @@ otherwise. The plug chooses the id of a new rule.
 ### Who can use the web app and API
 
 Without `-listen` there is neither. With it, anyone who can reach the address
-can switch the plug and change the schedule, so choose the address with care:
+can switch the plug and change its rules, so choose the address with care:
 `127.0.0.1` keeps them to the machine itself.
 
-To require a token, set `KASAD_TOKEN` in the environment of `serve`. Every
-API request must then carry it:
+Two environment variables of `serve` decide who else gets in:
+
+| Variable | Who it is for | How it is shown |
+|---|---|---|
+| `KASAD_PASSWORD` | People, in the web app | Typed once on the sign-in screen |
+| `KASAD_TOKEN` | Programs, such as scripts and `curl` | Sent with every request |
+
+```
+KASAD_PASSWORD='a phrase of your own' kasad -host 192.0.2.10 -data /var/lib/kasad -listen 0.0.0.0:8080 serve
+```
+
+With neither set, the web app and the API are open. With either set, every
+API request has to show one of them. Set a password whenever kasad listens on
+an address other machines can reach; `serve` logs a warning if it has neither.
+
+**Signing in.** The web app asks for the password and then keeps the person
+signed in on that browser for 30 days, or until they sign out.
+
+- Signing in sets a cookie that scripts in the page cannot read and that the
+  browser does not send along with requests started by other sites. The
+  password itself is not kept in the browser.
+- Sessions are held in memory, so restarting kasad signs everyone out.
+- After five wrong passwords in a row, kasad makes the next attempt wait: a
+  second at first, then twice as long each time, up to a minute. A right
+  password clears the count. The count is shared by everyone, so someone on
+  the network can keep others from signing in by guessing wrongly over and
+  over. They cannot use it to get in, and people already signed in are not
+  affected.
+- A request that changes something is refused if a browser sent it on behalf
+  of a page kasad did not serve.
+- The web app's own files are served to anyone, since a browser has nothing
+  to show when it first asks, and they hold nothing secret.
+
+**Programs** send the token instead:
 
 ```
 curl -H 'Authorization: Bearer the-token' http://192.0.2.20:8080/api/status
 ```
 
-The web app's own files are still served to anyone, since a browser has no
-token to send when it first asks, and they hold nothing secret. The page then
-asks for the token before it can show or do anything, and keeps it in that
-browser's storage so that it is only asked for once.
+A kasad with a token but no password protects the API, but leaves nobody able
+to sign in to the web app, which then says so.
 
-Set a token whenever kasad listens on an address other machines can reach.
-`serve` logs a warning if it does not have one. Everything is plain HTTP, so
-on a network you do not trust, put it behind something that adds TLS.
+**This is meant for a network you trust.** Everything is plain HTTP, so the
+password, the token and the cookie can all be read by anyone who can watch
+the traffic. To use kasad across a network you do not trust, put it behind
+something that adds TLS. If that passes on `X-Forwarded-Proto: https`, the
+cookie is marked for HTTPS only.
 
 ## Layout
 
@@ -351,9 +391,13 @@ on a network you do not trust, put it behind something that adds TLS.
 
 ## Security
 
-The protocol has no authentication. Anything that can reach port 9999 on a
-plug can control it, so keep plugs on a network that only trusted machines
-can reach.
+The plug's protocol has no authentication. Anything that can reach port 9999
+on a plug can control it, so keep plugs on a network that only trusted
+machines can reach.
+
+kasad's own web app and API can ask for a password and a token, but speak
+plain HTTP. See "Who can use the web app and API" above for what that does
+and does not protect.
 
 ## Tests
 

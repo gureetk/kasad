@@ -3,7 +3,6 @@
 // Paths are relative, so the page also works when kasad is published under a
 // path of some other server.
 
-const TOKEN_KEY = 'kasad.token';
 // Storing a rule on the plug takes kasad several exchanges with it, each of
 // which may wait a while for an answer.
 const TIMEOUT_MS = 30000;
@@ -25,44 +24,12 @@ export class Unreachable extends Error {
   }
 }
 
-// The token is kept in this browser so that it need only be typed once. If
-// the browser offers no storage, it lasts until the page is closed.
-let fallbackToken = '';
-
-export function getToken() {
-  try {
-    return localStorage.getItem(TOKEN_KEY) ?? '';
-  } catch {
-    return fallbackToken;
-  }
-}
-
-export function setToken(token) {
-  fallbackToken = token;
-  try {
-    if (token) {
-      localStorage.setItem(TOKEN_KEY, token);
-    } else {
-      localStorage.removeItem(TOKEN_KEY);
-    }
-  } catch {
-    // Without storage the token above still serves this visit.
-  }
-}
-
-// A header can only carry bytes, so send the token as UTF-8, one character
-// per byte. That is also what a command-line client would put on the wire.
-function headerBytes(text) {
-  return String.fromCharCode(...new TextEncoder().encode(text));
-}
-
+// The page shows who it is with the cookie that signing in sets. The browser
+// keeps that cookie out of reach of scripts and sends it by itself, so there
+// is nothing here to store or attach.
 async function call(method, path, body) {
   const headers = { Accept: 'application/json' };
-  const token = getToken();
-  if (token) {
-    headers.Authorization = `Bearer ${headerBytes(token)}`;
-  }
-  const request = { method, headers, cache: 'no-store', credentials: 'omit' };
+  const request = { method, headers, cache: 'no-store', credentials: 'same-origin' };
   if (body !== undefined) {
     headers['Content-Type'] = 'application/json';
     request.body = JSON.stringify(body);
@@ -105,3 +72,9 @@ export const getPlugRules = () => call('GET', 'api/plug/rules');
 export const addPlugRule = (rule) => call('POST', 'api/plug/rules', rule);
 export const putPlugRule = (id, rule) => call('PUT', plugRule(id), rule);
 export const deletePlugRule = (id) => call('DELETE', plugRule(id));
+
+// Signing in and out. getSession says whether kasad wants a sign-in, whether
+// it has a password to sign in with, and whether this browser is signed in.
+export const getSession = () => call('GET', 'api/session');
+export const signIn = (password) => call('POST', 'api/session', { password });
+export const signOut = () => call('DELETE', 'api/session');

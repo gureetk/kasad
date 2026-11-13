@@ -25,10 +25,17 @@ const (
 	stateFile    = "state.json"
 )
 
-// tokenEnv names the environment variable that holds the API token. It is
-// read from the environment, not from a flag, so that it does not show up in
-// the process list.
-const tokenEnv = "KASAD_TOKEN"
+// tokenEnv and passwordEnv name the environment variables that hold the
+// API's token, which is for programs, and the web app's password, which is
+// for people. They are read from the environment, not from flags, so that
+// they do not show up in the process list.
+const (
+	tokenEnv    = "KASAD_TOKEN"
+	passwordEnv = "KASAD_PASSWORD"
+)
+
+// shortPassword is the length below which serve remarks on the password.
+const shortPassword = 8
 
 // clockRetryInterval is how long serve waits before trying again after it
 // could not set the plug's clock.
@@ -42,7 +49,8 @@ type serveOptions struct {
 	dataDir      string
 	syncInterval time.Duration // zero means never set the plug's clock
 	listen       string        // empty means no web app or API
-	token        string        // empty means the API asks for no token
+	token        string        // empty means the API takes no token
+	password     string        // empty means nobody can sign in to the web app
 }
 
 // serve runs the schedule in the data directory against the plug, keeps the
@@ -97,14 +105,15 @@ func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment
 	if listener != nil {
 		// The web app's files are open to anyone who can reach the address.
 		// Everything they can do goes through the API, which is where the
-		// token is checked.
+		// password and the token are checked.
 		mux := http.NewServeMux()
 		mux.Handle("/api/", (&api.Server{
-			Plug:   p,
-			Store:  store,
-			Token:  opts.token,
-			Now:    env.now,
-			Logger: logger,
+			Plug:     p,
+			Store:    store,
+			Token:    opts.token,
+			Password: opts.password,
+			Now:      env.now,
+			Logger:   logger,
 		}).Handler())
 		mux.Handle("/", web.Handler())
 
@@ -116,9 +125,19 @@ func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment
 			IdleTimeout:       2 * time.Minute,
 			ErrorLog:          slog.NewLogLogger(handler, slog.LevelWarn),
 		}
-		logger.Info("serving the web app and API", "addr", listener.Addr().String(), "token", opts.token != "")
-		if opts.token == "" && !isLoopback(listener.Addr()) {
-			logger.Warn("the web app and API can be reached from other machines and ask for no token; set " + tokenEnv + " to require one")
+		logger.Info("serving the web app and API", "addr", listener.Addr().String(),
+			"password", opts.password != "", "token", opts.token != "")
+		switch reachable := !isLoopback(listener.Addr()); {
+		case reachable && opts.password == "" && opts.token == "":
+			logger.Warn("the web app and API can be reached from other machines and ask for no password or token; set " +
+				passwordEnv + " to make people sign in")
+		case reachable && opts.password != "":
+			// Said once at the start, since it is how kasad is meant to
+			// be run for now and not a fault.
+			logger.Info("signing in is over plain HTTP, so anyone who can watch the network can read the password; this is meant for a network you trust")
+		}
+		if opts.password != "" && len(opts.password) < shortPassword {
+			logger.Warn("the password in " + passwordEnv + " is short; it is all that stands between the network and the plug")
 		}
 
 		background.Add(2)

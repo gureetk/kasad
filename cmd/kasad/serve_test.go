@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -457,7 +458,7 @@ func TestServeAPI(t *testing.T) {
 		t.Errorf("exit code = %d, want %d. Log:\n%s", code, exitOK, s.stderr.String())
 	}
 	// Loopback only, so no warning about an open API.
-	if strings.Contains(s.stderr.String(), "ask for no token") {
+	if strings.Contains(s.stderr.String(), "ask for no password or token") {
 		t.Errorf("serve warned about an API that only this machine can reach:\n%s", s.stderr.String())
 	}
 }
@@ -558,16 +559,100 @@ func TestServeWarnsAboutAnOpenAPI(t *testing.T) {
 
 	open := startServe(t, mock, t.TempDir(), "-sync-interval", "0", "-listen", "0.0.0.0:0")
 	open.waitForLog("serving the web app and API")
-	open.waitForLog("ask for no token")
+	open.waitForLog("ask for no password or token")
 	open.stop()
 
-	vars := map[string]string{tokenEnv: "s3cret"}
-	guarded := startServeWithEnv(t, mock, t.TempDir(), vars, "-sync-interval", "0", "-listen", "0.0.0.0:0")
-	guarded.waitForLog("serving the web app and API")
-	guarded.settle()
-	guarded.stop()
-	if strings.Contains(guarded.stderr.String(), "ask for no token") {
-		t.Errorf("serve warned about an API that has a token:\n%s", guarded.stderr.String())
+	for name, vars := range map[string]map[string]string{
+		"a token":    {tokenEnv: "s3cret"},
+		"a password": {passwordEnv: "correct horse"},
+	} {
+		guarded := startServeWithEnv(t, mock, t.TempDir(), vars, "-sync-interval", "0", "-listen", "0.0.0.0:0")
+		guarded.waitForLog("serving the web app and API")
+		guarded.settle()
+		guarded.stop()
+		if strings.Contains(guarded.stderr.String(), "ask for no password or token") {
+			t.Errorf("serve warned about an API that has %s:\n%s", name, guarded.stderr.String())
+		}
+	}
+}
+
+func TestServeSaysWhatAPasswordOverPlainHTTPMeans(t *testing.T) {
+	mock := startMock(t)
+	vars := map[string]string{passwordEnv: "correct horse"}
+
+	// Reachable from other machines: say once that the password crosses
+	// the network in the clear.
+	reachable := startServeWithEnv(t, mock, t.TempDir(), vars, "-sync-interval", "0", "-listen", "0.0.0.0:0")
+	reachable.waitForLog(`password=true token=false`)
+	reachable.waitForLog("meant for a network you trust")
+	reachable.stop()
+	if strings.Contains(reachable.stderr.String(), "is short") {
+		t.Errorf("serve called a 13-character password short:\n%s", reachable.stderr.String())
+	}
+	if strings.Contains(reachable.stderr.String(), "correct horse") {
+		t.Errorf("the password is in the log:\n%s", reachable.stderr.String())
+	}
+
+	// On this machine only, there is no network to watch.
+	local := startServeWithEnv(t, mock, t.TempDir(), vars, "-sync-interval", "0", "-listen", "127.0.0.1:0")
+	local.waitForLog("serving the web app and API")
+	local.settle()
+	local.stop()
+	if strings.Contains(local.stderr.String(), "plain HTTP") {
+		t.Errorf("serve mentioned the network though only this machine can reach it:\n%s", local.stderr.String())
+	}
+
+	short := startServeWithEnv(t, mock, t.TempDir(), map[string]string{passwordEnv: "hunter2"}, "-sync-interval", "0", "-listen", "127.0.0.1:0")
+	short.waitForLog("is short")
+	short.stop()
+	if strings.Contains(short.stderr.String(), "hunter2") {
+		t.Errorf("the password is in the log:\n%s", short.stderr.String())
+	}
+}
+
+func TestServeSignIn(t *testing.T) {
+	mock := startMock(t)
+	vars := map[string]string{passwordEnv: "correct horse"}
+	s := startServeWithEnv(t, mock, t.TempDir(), vars, "-sync-interval", "0", "-listen", "127.0.0.1:0")
+
+	// The page is there for anyone, so that there is somewhere to sign in.
+	if code, body := s.request("GET", "/", "", nil); code != http.StatusOK {
+		t.Fatalf("GET / = %d:\n%s", code, body)
+	}
+	if code, body := s.request("GET", "/api/status", "", nil); code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/status before signing in = %d:\n%s", code, body)
+	}
+
+	// A browser keeps the cookie that signing in sets, and sends it back.
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := &http.Client{Timeout: 10 * time.Second, Jar: jar}
+	post := func(path, body string) int {
+		t.Helper()
+		response, err := browser.Post(s.apiURL(path), "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		response.Body.Close()
+		return response.StatusCode
+	}
+	if code := post("/api/session", `{"password": "wrong"}`); code != http.StatusUnauthorized {
+		t.Errorf("signing in with the wrong password = %d, want 401", code)
+	}
+	if code := post("/api/session", `{"password": "correct horse"}`); code != http.StatusOK {
+		t.Fatalf("signing in = %d, want 200", code)
+	}
+	if code := post("/api/relay", `{"on": true}`); code != http.StatusOK || !mock.RelayOn() {
+		t.Errorf("switching the plug once signed in = %d, plug on = %v", code, mock.RelayOn())
+	}
+
+	s.waitForLog("wrong password given to the web app")
+	s.waitForLog("signed in to the web app")
+	s.stop()
+	if strings.Contains(s.stderr.String(), "correct horse") {
+		t.Errorf("the password is in the log:\n%s", s.stderr.String())
 	}
 }
 
