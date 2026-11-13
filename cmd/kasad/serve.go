@@ -19,10 +19,12 @@ import (
 	"github.com/gureetk/kasad/schedule"
 )
 
-// The files serve keeps in its data directory.
+// The files serve keeps in its data directory: the schedule, how far it has
+// got with it, and who is signed in to the web app.
 const (
 	scheduleFile = "schedule.json"
 	stateFile    = "state.json"
+	sessionsFile = "sessions.json"
 )
 
 // tokenEnv and passwordEnv name the environment variables that hold the
@@ -108,12 +110,13 @@ func serve(ctx context.Context, p *plug.Plug, opts serveOptions, env environment
 		// password and the token are checked.
 		mux := http.NewServeMux()
 		mux.Handle("/api/", (&api.Server{
-			Plug:     p,
-			Store:    store,
-			Token:    opts.token,
-			Password: opts.password,
-			Now:      env.now,
-			Logger:   logger,
+			Plug:        p,
+			Store:       store,
+			Token:       opts.token,
+			Password:    opts.password,
+			SessionFile: filepath.Join(opts.dataDir, sessionsFile),
+			Now:         env.now,
+			Logger:      logger,
 		}).Handler())
 		mux.Handle("/", web.Handler())
 

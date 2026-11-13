@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -43,14 +44,56 @@ func sameSecret(a, b string) bool {
 	return subtle.ConstantTimeCompare(x[:], y[:]) == 1
 }
 
-// sessions holds the sessions that are current. Sessions are kept in memory
-// only, so they end when the program does. The zero value is ready to use.
+// sessions holds the sessions that are current. The zero value is ready to
+// use and keeps them in memory only, so that they end when the program does.
+// With a path, they are also kept in a file: see save and load.
 type sessions struct {
 	mu sync.Mutex
-	// expires maps the hash of each session's id to when it runs out. The
-	// ids themselves, which are as good as the password while they last,
-	// are not kept.
-	expires map[[sha256.Size]byte]time.Time
+
+	// secret keys the digests below. The server sets it to the password
+	// before the sessions are first used, so a session begun under one
+	// password means nothing under another.
+	secret []byte
+
+	// path names the file the sessions are saved in. Empty means none.
+	path string
+
+	// expires maps the digest of each session's id to when it runs out.
+	// The ids themselves, which are as good as the password while they
+	// last, are not kept: not here, and not in the file.
+	expires map[sessionDigest]time.Time
+}
+
+// sessionDigest stands for a session's id. It is the id's HMAC-SHA256 under
+// the secret, and the id cannot be worked out from it.
+type sessionDigest [sha256.Size]byte
+
+func (s *sessions) digest(id string) sessionDigest {
+	mac := hmac.New(sha256.New, s.secret)
+	mac.Write([]byte(id))
+	var digest sessionDigest
+	mac.Sum(digest[:0])
+	return digest
+}
+
+// trim drops the sessions that have run out, and then those nearest their
+// end until no more than limit are left. The caller holds s.mu.
+func (s *sessions) trim(now time.Time, limit int) {
+	for digest, expiry := range s.expires {
+		if !now.Before(expiry) {
+			delete(s.expires, digest)
+		}
+	}
+	for len(s.expires) > limit {
+		var nearest sessionDigest
+		var soonest time.Time
+		for digest, expiry := range s.expires {
+			if soonest.IsZero() || expiry.Before(soonest) {
+				nearest, soonest = digest, expiry
+			}
+		}
+		delete(s.expires, nearest)
+	}
 }
 
 // start begins a session and returns its id, which is the cookie's value.
@@ -64,25 +107,10 @@ func (s *sessions) start(now time.Time) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.expires == nil {
-		s.expires = make(map[[sha256.Size]byte]time.Time)
+		s.expires = make(map[sessionDigest]time.Time)
 	}
-	for key, expiry := range s.expires {
-		if !now.Before(expiry) {
-			delete(s.expires, key)
-		}
-	}
-	for len(s.expires) >= maxSessions {
-		// Make room by ending the session nearest its end.
-		var oldest [sha256.Size]byte
-		var soonest time.Time
-		for key, expiry := range s.expires {
-			if soonest.IsZero() || expiry.Before(soonest) {
-				oldest, soonest = key, expiry
-			}
-		}
-		delete(s.expires, oldest)
-	}
-	s.expires[sha256.Sum256([]byte(id))] = now.Add(sessionLifetime)
+	s.trim(now, maxSessions-1) // leave room for this one
+	s.expires[s.digest(id)] = now.Add(sessionLifetime)
 	return id, nil
 }
 
@@ -93,15 +121,19 @@ func (s *sessions) valid(id string, now time.Time) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	expiry, ok := s.expires[sha256.Sum256([]byte(id))]
+	expiry, ok := s.expires[s.digest(id)]
 	return ok && now.Before(expiry)
 }
 
-// end finishes the session with the given id, if there is one.
-func (s *sessions) end(id string) {
+// end finishes the session with the given id, and reports whether there was
+// one.
+func (s *sessions) end(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.expires, sha256.Sum256([]byte(id)))
+	digest := s.digest(id)
+	_, ok := s.expires[digest]
+	delete(s.expires, digest)
+	return ok
 }
 
 // attempts slows down guessing at the password. It counts wrong passwords
@@ -150,6 +182,34 @@ func (a *attempts) succeeded() {
 	defer a.mu.Unlock()
 	a.failures = 0
 	a.blocked = time.Time{}
+}
+
+// prepare gets the sessions ready for use: it keys them with the password
+// and takes up the ones saved by an earlier run.
+func (s *Server) prepare() {
+	s.sessions.secret = []byte(s.Password)
+	if s.Password == "" || s.SessionFile == "" {
+		return
+	}
+	s.sessions.path = s.SessionFile
+	kept, err := s.sessions.load(s.now())
+	switch {
+	case err != nil:
+		// Not worth refusing to start over: the cost is that people sign
+		// in again, and the next save replaces the file.
+		s.logger().Warn("could not read the saved sessions, so everyone has to sign in again", "error", err)
+	case kept > 0:
+		s.logger().Info("sessions carried over from the last run", "sessions", kept)
+	}
+}
+
+// saveSessions saves the sessions after a change to them. If that fails,
+// the change still holds for as long as the program runs.
+func (s *Server) saveSessions() {
+	if err := s.sessions.save(); err != nil {
+		s.logger().Error("could not save the sessions; after a restart they will be as they were last saved",
+			"error", err)
+	}
 }
 
 // open reports whether the API is open to anyone who can reach it.
@@ -262,14 +322,15 @@ func (s *Server) postSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not sign in")
 		return
 	}
+	s.saveSessions()
 	http.SetCookie(w, s.cookie(r, id, int(sessionLifetime/time.Second)))
 	s.logger().Info("signed in to the web app", "from", r.RemoteAddr)
 	writeJSON(w, http.StatusOK, s.sessionState(true))
 }
 
 func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
-	if cookie, err := r.Cookie(sessionCookie); err == nil {
-		s.sessions.end(cookie.Value)
+	if cookie, err := r.Cookie(sessionCookie); err == nil && s.sessions.end(cookie.Value) {
+		s.saveSessions()
 	}
 	http.SetCookie(w, s.cookie(r, "", -1))
 	writeJSON(w, http.StatusOK, s.sessionState(s.open()))

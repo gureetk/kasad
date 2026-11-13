@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gureetk/kasad/plug"
@@ -69,6 +70,12 @@ type Server struct {
 	// of the two, except those to /api/session.
 	Password string
 
+	// SessionFile, if not empty, names a file in which the sessions of
+	// people who have signed in are kept, so that they stay signed in
+	// when the program is restarted. Without it, a restart signs everyone
+	// out. It is used only when there is a Password.
+	SessionFile string
+
 	// Now returns the current time. It defaults to time.Now.
 	Now func() time.Time
 
@@ -76,6 +83,10 @@ type Server struct {
 	// defaults to discarding everything.
 	Logger *slog.Logger
 
+	// prepared guards the work of the first call to Handler, which
+	// readies the sessions with Password and SessionFile. Neither is to
+	// be changed after that.
+	prepared sync.Once
 	sessions sessions
 	attempts attempts
 }
@@ -108,8 +119,10 @@ func allowedMethods(path string) (string, bool) {
 	return "", false
 }
 
-// Handler returns the handler for everything under /api/.
+// Handler returns the handler for everything under /api/. The first call
+// also reads the sessions saved in SessionFile.
 func (s *Server) Handler() http.Handler {
+	s.prepared.Do(s.prepare)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", s.getStatus)
 	mux.HandleFunc("POST /api/relay", s.postRelay)

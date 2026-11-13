@@ -1,8 +1,16 @@
 package api_test
 
 import (
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -333,5 +341,318 @@ func TestSessionPathAllowsOnlyItsMethods(t *testing.T) {
 	wantStatus(t, r, http.StatusMethodNotAllowed)
 	if r.header.Get("Allow") != "DELETE, GET, HEAD, POST" {
 		t.Errorf("Allow = %q", r.header.Get("Allow"))
+	}
+}
+
+// logBuffer collects a server's log, for tests that check what it says.
+type logBuffer struct {
+	mu   sync.Mutex
+	text strings.Builder
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.text.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.text.String()
+}
+
+// newRun returns a fixture that stands for one run of kasad with a password
+// and a file to keep its sessions in, along with what that run logs. A
+// second one given the same file stands for kasad having been restarted.
+func newRun(t *testing.T, file, password string) (*fixture, *logBuffer) {
+	t.Helper()
+	f := newFixture(t)
+	log := &logBuffer{}
+	f.server.Password = password
+	f.server.SessionFile = file
+	f.server.Logger = slog.New(slog.NewTextHandler(log, nil))
+	return f, log
+}
+
+// savedSessionCount returns how many sessions the file holds.
+func savedSessionCount(t *testing.T, file string) int {
+	t.Helper()
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved struct {
+		Sessions []struct {
+			Digest  string    `json:"digest"`
+			Expires time.Time `json:"expires"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("the session file is not as expected: %v\n%s", err, data)
+	}
+	if saved.Sessions == nil {
+		t.Fatalf("the session file has no list of sessions:\n%s", data)
+	}
+	return len(saved.Sessions)
+}
+
+func TestSessionsOutlastARestart(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "sessions.json")
+	before, _ := newRun(t, file, password)
+	signedIn := before.signIn(t)
+	wantStatus(t, before.do("GET", "/api/status", "", signedIn), http.StatusOK)
+
+	after, log := newRun(t, file, password)
+	wantSession(t, after.do("GET", "/api/session", "", signedIn), true, true, true)
+	wantStatus(t, after.do("POST", "/api/relay", `{"on": true}`, signedIn), http.StatusOK)
+	if !after.mock.RelayOn() {
+		t.Error("the plug is off after a request that carried a session from before the restart")
+	}
+	if !strings.Contains(log.String(), `msg="sessions carried over from the last run" sessions=1`) {
+		t.Errorf("the log does not say that a session was carried over:\n%s", log.String())
+	}
+
+	// Being restarted makes nothing else into a session.
+	wantStatus(t, after.do("GET", "/api/status", "", nil), http.StatusUnauthorized)
+	wantStatus(t, after.do("GET", "/api/status", "", map[string]string{"Cookie": "kasad_session=made-up"}),
+		http.StatusUnauthorized)
+}
+
+func TestSeveralSessionsOutlastARestart(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "sessions.json")
+	before, _ := newRun(t, file, password)
+
+	// People signing in at the same moment must not lose each other's
+	// sessions from the file.
+	const people = 8
+	replies := make([]reply, people)
+	var signingIn sync.WaitGroup
+	for i := range replies {
+		signingIn.Add(1)
+		go func() {
+			defer signingIn.Done()
+			response, err := http.Post(before.http.URL+"/api/session", "application/json",
+				strings.NewReader(`{"password": "`+password+`"}`))
+			if err != nil {
+				t.Errorf("signing in: %v", err)
+				return
+			}
+			response.Body.Close()
+			replies[i] = reply{status: response.StatusCode, header: response.Header}
+		}()
+	}
+	signingIn.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+	cookies := make([]map[string]string, people)
+	for i, r := range replies {
+		wantStatus(t, r, http.StatusOK)
+		cookie := sessionCookie(t, r)
+		cookies[i] = map[string]string{"Cookie": cookie.Name + "=" + cookie.Value}
+	}
+	if got := savedSessionCount(t, file); got != people {
+		t.Errorf("the file holds %d sessions, want %d", got, people)
+	}
+
+	after, _ := newRun(t, file, password)
+	for i, signedIn := range cookies {
+		if r := after.do("GET", "/api/status", "", signedIn); r.status != http.StatusOK {
+			t.Errorf("session %d after the restart = %d, want 200", i, r.status)
+		}
+	}
+}
+
+func TestSigningOutOutlastsARestart(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "sessions.json")
+	before, _ := newRun(t, file, password)
+	leaving, staying := before.signIn(t), before.signIn(t)
+	wantStatus(t, before.do("DELETE", "/api/session", "", leaving), http.StatusOK)
+	if got := savedSessionCount(t, file); got != 1 {
+		t.Errorf("the file holds %d sessions after one of two signed out, want 1", got)
+	}
+
+	after, _ := newRun(t, file, password)
+	wantStatus(t, after.do("GET", "/api/status", "", leaving), http.StatusUnauthorized)
+	wantStatus(t, after.do("GET", "/api/status", "", staying), http.StatusOK)
+}
+
+func TestAChangedPasswordEndsSavedSessions(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "sessions.json")
+	before, _ := newRun(t, file, password)
+	signedIn := before.signIn(t)
+
+	changed, _ := newRun(t, file, "another password altogether")
+	wantSession(t, changed.do("GET", "/api/session", "", signedIn), true, true, false)
+	wantStatus(t, changed.do("GET", "/api/status", "", signedIn), http.StatusUnauthorized)
+
+	// It is the password that decides, not that there was a restart with
+	// another one in between.
+	back, _ := newRun(t, file, password)
+	wantStatus(t, back.do("GET", "/api/status", "", signedIn), http.StatusOK)
+}
+
+func TestSavedSessionsStillRunOut(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "sessions.json")
+	before, _ := newRun(t, file, password)
+	signedIn := before.signIn(t)
+
+	// Started again a moment before the session runs out, kasad takes it
+	// up, and then lets it run out.
+	now := testNow.Add(30*24*time.Hour - time.Second)
+	inTime, _ := newRun(t, file, password)
+	inTime.server.Now = func() time.Time { return now }
+	wantStatus(t, inTime.do("GET", "/api/status", "", signedIn), http.StatusOK)
+	now = now.Add(time.Second)
+	wantStatus(t, inTime.do("GET", "/api/status", "", signedIn), http.StatusUnauthorized)
+
+	// Started again after that, it does not take the session up at all.
+	late, log := newRun(t, file, password)
+	late.server.Now = func() time.Time { return testNow.Add(30 * 24 * time.Hour) }
+	wantStatus(t, late.do("GET", "/api/status", "", signedIn), http.StatusUnauthorized)
+	if strings.Contains(log.String(), "carried over") {
+		t.Errorf("the log says a session was carried over when it had run out:\n%s", log.String())
+	}
+}
+
+func TestSessionFileHoldsNothingToSignInWith(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "sessions.json")
+	f, log := newRun(t, file, password)
+	r := f.do("POST", "/api/session", `{"password": "`+password+`"}`, nil)
+	wantStatus(t, r, http.StatusOK)
+	cookie := sessionCookie(t, r)
+
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), cookie.Value) {
+		t.Errorf("the session's id is in the file:\n%s", data)
+	}
+	if strings.Contains(string(data), password) {
+		t.Errorf("the password is in the file:\n%s", data)
+	}
+	if strings.Contains(log.String(), cookie.Value) || strings.Contains(log.String(), password) {
+		t.Errorf("the session's id or the password is in the log:\n%s", log.String())
+	}
+	if got := savedSessionCount(t, file); got != 1 {
+		t.Errorf("the file holds %d sessions, want 1", got)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Errorf("the file's mode is %o, want 600", mode)
+		}
+	}
+}
+
+func TestADamagedSessionFileSignsEveryoneOut(t *testing.T) {
+	digest := strings.Repeat("ab", 32)
+	damaged := map[string]string{
+		"empty":             "",
+		"not JSON":          "sessions\n",
+		"not a list":        `{"sessions": "none"}`,
+		"cut short":         `{"sessions": [{"digest": "` + digest + `", "expires": "2001-03-01T00:00:00Z"}`,
+		"short digest":      `{"sessions": [{"digest": "abab", "expires": "2001-03-01T00:00:00Z"}]}`,
+		"long digest":       `{"sessions": [{"digest": "` + digest + `ab", "expires": "2001-03-01T00:00:00Z"}]}`,
+		"digest of letters": `{"sessions": [{"digest": "` + strings.Repeat("xy", 32) + `", "expires": "2001-03-01T00:00:00Z"}]}`,
+		"no digest":         `{"sessions": [{"expires": "2001-03-01T00:00:00Z"}]}`,
+		"expiry not a time": `{"sessions": [{"digest": "` + digest + `", "expires": "soon"}]}`,
+	}
+	for name, content := range damaged {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "sessions.json")
+			if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			f, log := newRun(t, file, password)
+
+			wantStatus(t, f.do("GET", "/api/status", "", nil), http.StatusUnauthorized)
+			if !strings.Contains(log.String(), "level=WARN") || !strings.Contains(log.String(), "could not read the saved sessions") {
+				t.Errorf("the log does not warn that the sessions could not be read:\n%s", log.String())
+			}
+
+			// Signing in works as usual, and puts the file right.
+			signedIn := f.signIn(t)
+			wantStatus(t, f.do("GET", "/api/status", "", signedIn), http.StatusOK)
+			if got := savedSessionCount(t, file); got != 1 {
+				t.Errorf("the file holds %d sessions after signing in, want 1", got)
+			}
+			after, _ := newRun(t, file, password)
+			wantStatus(t, after.do("GET", "/api/status", "", signedIn), http.StatusOK)
+		})
+	}
+}
+
+func TestOneBadSessionSpoilsTheFile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "sessions.json")
+	before, _ := newRun(t, file, password)
+	signedIn := before.signIn(t)
+
+	// Add an entry that cannot be right beside the good one. A file that
+	// kasad did not write is not half believed.
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoiled := strings.Replace(string(data), `"sessions": [`, `"sessions": [{"digest": "abab", "expires": "2001-03-01T00:00:00Z"},`, 1)
+	if spoiled == string(data) {
+		t.Fatalf("could not add an entry to the file:\n%s", data)
+	}
+	if err := os.WriteFile(file, []byte(spoiled), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	after, _ := newRun(t, file, password)
+	wantStatus(t, after.do("GET", "/api/status", "", signedIn), http.StatusUnauthorized)
+}
+
+func TestSigningInWorksWhenSessionsCannotBeSaved(t *testing.T) {
+	// The directory the file belongs in does not exist.
+	file := filepath.Join(t.TempDir(), "missing", "sessions.json")
+	f, log := newRun(t, file, password)
+
+	signedIn := f.signIn(t)
+	wantStatus(t, f.do("GET", "/api/status", "", signedIn), http.StatusOK)
+	if !strings.Contains(log.String(), "level=ERROR") || !strings.Contains(log.String(), "could not save the sessions") {
+		t.Errorf("the log does not say that the sessions could not be saved:\n%s", log.String())
+	}
+	wantStatus(t, f.do("DELETE", "/api/session", "", signedIn), http.StatusOK)
+	wantStatus(t, f.do("GET", "/api/status", "", signedIn), http.StatusUnauthorized)
+}
+
+func TestSessionFileIsLeftAloneWhenNotInUse(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "sessions.json")
+	before, _ := newRun(t, file, password)
+	signedIn := before.signIn(t)
+	saved, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// With no password there is nothing to sign in to, and so no use for
+	// the file. Requests neither read it nor change it.
+	open, log := newRun(t, file, "")
+	wantSession(t, open.do("GET", "/api/session", "", signedIn), false, false, true)
+	wantSession(t, open.do("DELETE", "/api/session", "", signedIn), false, false, true)
+	if strings.Contains(log.String(), "sessions") {
+		t.Errorf("the log speaks of sessions when there is no password:\n%s", log.String())
+	}
+	if now, err := os.ReadFile(file); err != nil || string(now) != string(saved) {
+		t.Errorf("the file changed while there was no password (error %v):\n%s", err, now)
+	}
+}
+
+func TestSigningOutWithoutASessionSavesNothing(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "sessions.json")
+	f, _ := newRun(t, file, password)
+	wantStatus(t, f.do("DELETE", "/api/session", "", nil), http.StatusOK)
+	wantStatus(t, f.do("DELETE", "/api/session", "", map[string]string{"Cookie": "kasad_session=made-up"}), http.StatusOK)
+	if _, err := os.Stat(file); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a file was written though no session began or ended (error %v)", err)
 	}
 }

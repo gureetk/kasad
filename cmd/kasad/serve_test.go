@@ -656,6 +656,77 @@ func TestServeSignIn(t *testing.T) {
 	}
 }
 
+func TestServeKeepsPeopleSignedInAcrossARestart(t *testing.T) {
+	mock := startMock(t)
+	dir := t.TempDir()
+	start := func(password string) *serving {
+		vars := map[string]string{passwordEnv: password}
+		return startServeWithEnv(t, mock, dir, vars, "-sync-interval", "0", "-listen", "127.0.0.1:0")
+	}
+
+	// One browser throughout. Each run listens on a port of its own, which
+	// makes no difference to which cookies a browser sends.
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := &http.Client{Timeout: 10 * time.Second, Jar: jar}
+	status := func(s *serving) int {
+		t.Helper()
+		response, err := browser.Get(s.apiURL("/api/status"))
+		if err != nil {
+			t.Fatalf("GET /api/status: %v", err)
+		}
+		response.Body.Close()
+		return response.StatusCode
+	}
+
+	first := start("correct horse")
+	response, err := browser.Post(first.apiURL("/api/session"), "application/json",
+		strings.NewReader(`{"password": "correct horse"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("signing in = %d, want 200", response.StatusCode)
+	}
+	var id string
+	for _, cookie := range response.Cookies() {
+		id = cookie.Value
+	}
+	if id == "" {
+		t.Fatal("signing in set no cookie")
+	}
+	if code := status(first); code != http.StatusOK {
+		t.Fatalf("GET /api/status once signed in = %d, want 200", code)
+	}
+	first.stop()
+
+	// The sessions are in the data directory, in a form that is no use
+	// for signing in.
+	saved, err := os.ReadFile(filepath.Join(dir, sessionsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(saved), id) || strings.Contains(string(saved), "correct horse") {
+		t.Errorf("the session file holds the cookie's value or the password:\n%s", saved)
+	}
+
+	second := start("correct horse")
+	if code := status(second); code != http.StatusOK {
+		t.Errorf("GET /api/status after a restart = %d, want 200. Log:\n%s", code, second.stderr.String())
+	}
+	second.waitForLog(`msg="sessions carried over from the last run" sessions=1`)
+	second.stop()
+
+	// Changing the password is how to sign everyone out.
+	third := start("another password")
+	if code := status(third); code != http.StatusUnauthorized {
+		t.Errorf("GET /api/status after the password changed = %d, want 401", code)
+	}
+}
+
 func TestServeFailsWhenTheAPIAddressIsTaken(t *testing.T) {
 	mock := startMock(t)
 	taken, err := net.Listen("tcp", "127.0.0.1:0")

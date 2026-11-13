@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"time"
+
+	"github.com/gureetk/kasad/internal/atomicfile"
 )
 
 // State is what a Runner remembers between runs.
@@ -55,28 +56,5 @@ func (f StateFile) Save(state State) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(f.Path, append(data, '\n'))
-}
-
-// writeFileAtomic replaces the file at path with data in one step: it writes
-// a temporary file beside it and renames that into place.
-func writeFileAtomic(path string, data []byte) error {
-	temp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(temp.Name()) // no effect once the rename has happened
-
-	if _, err := temp.Write(data); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Sync(); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(temp.Name(), path)
+	return atomicfile.Write(f.Path, append(data, '\n'))
 }
