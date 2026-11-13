@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -417,6 +418,149 @@ func TestPutScheduleRejectsAnOversizedBody(t *testing.T) {
 	wantStatus(t, r, http.StatusRequestEntityTooLarge)
 }
 
+// Three made-up rules on the plug: on at 07:30 on weekdays; off at sunset at
+// weekends, switched off; and one that runs once, on at 21:05 and off again.
+var plugRules = []mockplug.Rule{
+	{
+		ID: "00000000000000000000000000000001", Name: "morning", Enable: 1, Repeat: 1,
+		Weekdays: [7]int{0, 1, 1, 1, 1, 1, 0}, StartOption: 0, StartMinute: 450, StartAction: 1, EndAction: -1,
+	},
+	{
+		ID: "00000000000000000000000000000002", Name: "dusk", Enable: 0, Repeat: 1,
+		Weekdays: [7]int{1, 0, 0, 0, 0, 0, 1}, StartOption: 2, StartMinute: 0, StartAction: 0, EndAction: -1,
+	},
+	{
+		ID: "00000000000000000000000000000003", Enable: 1, Repeat: 0,
+		Weekdays: [7]int{0, 0, 0, 1, 0, 0, 0}, StartOption: 0, StartMinute: 1265, StartAction: 1, EndAction: 0,
+	},
+}
+
+func TestGetPlugRules(t *testing.T) {
+	f := newFixture(t)
+	f.mock.SetRules(plugRules...)
+
+	r := f.do("GET", "/api/plug/rules", "", nil)
+	wantStatus(t, r, http.StatusOK)
+
+	var want any
+	err := json.Unmarshal([]byte(`{
+	  "enabled": true,
+	  "rules": [
+	    {"id": "00000000000000000000000000000001", "name": "morning", "enabled": true, "weekly": true,
+	     "repeats": true, "days": ["mon", "tue", "wed", "thu", "fri"], "at": "time", "time": "07:30", "action": "on"},
+	    {"id": "00000000000000000000000000000002", "name": "dusk", "enabled": false, "weekly": false,
+	     "repeats": true, "days": ["sat", "sun"], "at": "sunset", "action": "off"},
+	    {"id": "00000000000000000000000000000003", "enabled": true, "weekly": false,
+	     "repeats": false, "days": ["wed"], "at": "time", "time": "21:05", "action": "on",
+	     "end": {"at": "unknown", "action": "off"}}
+	  ]
+	}`), &want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got any
+	if err := json.Unmarshal([]byte(r.body), &got); err != nil {
+		t.Fatalf("response is not JSON: %v\n%s", err, r.body)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("GET /api/plug/rules returned:\n%s", r.body)
+	}
+}
+
+func TestGetPlugRulesWhenThereAreNone(t *testing.T) {
+	f := newFixture(t)
+	f.mock.SetScheduleEnabled(false)
+
+	r := f.do("GET", "/api/plug/rules", "", nil)
+	wantStatus(t, r, http.StatusOK)
+	fields := r.fields(t)
+	if rules, ok := fields["rules"].([]any); !ok || len(rules) != 0 {
+		t.Errorf(`"rules" is %v, want an empty list`, fields["rules"])
+	}
+	if fields["enabled"] != false {
+		t.Errorf(`"enabled" is %v, want false`, fields["enabled"])
+	}
+}
+
+func TestGetPlugRulesReportsAnUnreachablePlug(t *testing.T) {
+	f := newFixture(t)
+	f.mock.Close()
+
+	r := f.do("GET", "/api/plug/rules", "", nil)
+	wantStatus(t, r, http.StatusBadGateway)
+	if message, _ := r.fields(t)["error"].(string); message == "" {
+		t.Errorf("no error message in:\n%s", r.body)
+	}
+}
+
+func TestDeletePlugRule(t *testing.T) {
+	f := newFixture(t)
+	f.mock.SetRules(plugRules...)
+
+	// A DELETE needs no body and no Content-Type.
+	r := f.do("DELETE", "/api/plug/rules/00000000000000000000000000000002", "", nil)
+	wantStatus(t, r, http.StatusOK)
+	if got := r.fields(t)["deleted"]; got != "00000000000000000000000000000002" {
+		t.Errorf(`"deleted" = %v`, got)
+	}
+	left := f.mock.Rules()
+	if len(left) != 2 || left[0].ID != plugRules[0].ID || left[1].ID != plugRules[2].ID {
+		t.Errorf("rules left on the plug: %+v, want the first and third", left)
+	}
+
+	// The schedule kasad runs is a different thing, and is not touched.
+	if rules := f.store.Schedule().Rules; len(rules) != 0 {
+		t.Errorf("deleting a rule on the plug changed kasad's schedule: %+v", rules)
+	}
+}
+
+func TestDeletePlugRuleThatIsNotThere(t *testing.T) {
+	f := newFixture(t)
+	f.mock.SetRules(plugRules...)
+
+	// The second id is a rule of kasad's own schedule, which is not the
+	// plug's to delete.
+	f.setSchedule(twoRules)
+	for _, id := range []string{"no-such-rule", "morning-on", "%20", "a%2Fb"} {
+		r := f.do("DELETE", "/api/plug/rules/"+id, "", nil)
+		wantStatus(t, r, http.StatusNotFound)
+		if message, _ := r.fields(t)["error"].(string); !strings.Contains(message, "no rule") {
+			t.Errorf("DELETE %s: error message %q does not say there is no such rule", id, message)
+		}
+	}
+	if left := f.mock.Rules(); len(left) != len(plugRules) {
+		t.Errorf("%d rules left on the plug, want all %d", len(left), len(plugRules))
+	}
+	if rules := f.store.Schedule().Rules; len(rules) != 2 {
+		t.Errorf("kasad's schedule has %d rules, want 2", len(rules))
+	}
+}
+
+func TestDeletePlugRuleReportsAnUnreachablePlug(t *testing.T) {
+	f := newFixture(t)
+	f.mock.SetRules(plugRules...)
+	f.mock.Close()
+
+	r := f.do("DELETE", "/api/plug/rules/00000000000000000000000000000001", "", nil)
+	wantStatus(t, r, http.StatusBadGateway)
+}
+
+func TestPlugRulesNeedTheToken(t *testing.T) {
+	f := newFixture(t)
+	f.mock.SetRules(plugRules...)
+	f.server.Token = "s3cret"
+
+	wantStatus(t, f.do("GET", "/api/plug/rules", "", nil), http.StatusUnauthorized)
+	wantStatus(t, f.do("DELETE", "/api/plug/rules/00000000000000000000000000000001", "", nil), http.StatusUnauthorized)
+	if left := f.mock.Rules(); len(left) != len(plugRules) {
+		t.Fatalf("a request without the token deleted a rule: %d left", len(left))
+	}
+
+	auth := map[string]string{"Authorization": "Bearer s3cret"}
+	wantStatus(t, f.do("GET", "/api/plug/rules", "", auth), http.StatusOK)
+	wantStatus(t, f.do("DELETE", "/api/plug/rules/00000000000000000000000000000001", "", auth), http.StatusOK)
+}
+
 func TestToken(t *testing.T) {
 	f := newFixture(t)
 	f.server.Token = "correct horse"
@@ -481,6 +625,12 @@ func TestUnknownPathsAndMethods(t *testing.T) {
 		{"DELETE", "/api/status", http.StatusMethodNotAllowed, "GET, HEAD"},
 		{"GET", "/api/relay", http.StatusMethodNotAllowed, "POST"},
 		{"DELETE", "/api/schedule", http.StatusMethodNotAllowed, "GET, HEAD, PUT"},
+		{"DELETE", "/api/plug/rules", http.StatusMethodNotAllowed, "GET, HEAD"},
+		{"GET", "/api/plug/rules/some-rule", http.StatusMethodNotAllowed, "DELETE"},
+		{"PUT", "/api/plug/rules/some-rule", http.StatusMethodNotAllowed, "DELETE"},
+		{"DELETE", "/api/plug/rules/", http.StatusNotFound, ""},
+		{"DELETE", "/api/plug/rules/some-rule/more", http.StatusNotFound, ""},
+		{"GET", "/api/plug", http.StatusNotFound, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {

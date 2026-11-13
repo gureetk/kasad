@@ -1,11 +1,13 @@
 // Package api serves kasad's JSON API over HTTP.
 //
-// The API has four operations, all under /api/:
+// The API has six operations, all under /api/:
 //
-//	GET  /api/status    the plug's state and the next scheduled event
-//	POST /api/relay     switch the plug on or off
-//	GET  /api/schedule  the schedule
-//	PUT  /api/schedule  replace the schedule
+//	GET    /api/status           the plug's state and the next scheduled event
+//	POST   /api/relay            switch the plug on or off
+//	GET    /api/schedule         the schedule kasad runs
+//	PUT    /api/schedule         replace the schedule kasad runs
+//	GET    /api/plug/rules       the rules the plug keeps and runs by itself
+//	DELETE /api/plug/rules/{id}  delete one of the plug's own rules
 //
 // Requests and responses are JSON. An error response has the form
 // {"error": "..."}.
@@ -20,6 +22,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +38,8 @@ const maxBodySize = 64 << 10
 type Device interface {
 	Status(ctx context.Context) (plug.Status, error)
 	Switch(ctx context.Context, on bool) (plug.Sysinfo, error)
+	Rules(ctx context.Context) (plug.Rules, error)
+	DeleteRule(ctx context.Context, id string) error
 }
 
 // Server holds what the API's handlers work with.
@@ -57,11 +62,27 @@ type Server struct {
 	Logger *slog.Logger
 }
 
-// routes lists the API's paths and the methods each one allows.
+// routes lists the API's fixed paths and the methods each one allows.
 var routes = map[string]string{
-	"/api/status":   "GET, HEAD",
-	"/api/relay":    "POST",
-	"/api/schedule": "GET, HEAD, PUT",
+	"/api/status":     "GET, HEAD",
+	"/api/relay":      "POST",
+	"/api/schedule":   "GET, HEAD, PUT",
+	"/api/plug/rules": "GET, HEAD",
+}
+
+// plugRulePrefix is the path of one of the plug's own rules, less its id.
+const plugRulePrefix = "/api/plug/rules/"
+
+// allowedMethods returns the methods the API allows on path, and whether
+// path is one of the API's at all.
+func allowedMethods(path string) (string, bool) {
+	if allowed, ok := routes[path]; ok {
+		return allowed, true
+	}
+	if id, ok := strings.CutPrefix(path, plugRulePrefix); ok && id != "" && !strings.Contains(id, "/") {
+		return "DELETE", true
+	}
+	return "", false
 }
 
 // Handler returns the handler for everything under /api/.
@@ -71,8 +92,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/relay", s.postRelay)
 	mux.HandleFunc("GET /api/schedule", s.getSchedule)
 	mux.HandleFunc("PUT /api/schedule", s.putSchedule)
+	mux.HandleFunc("GET /api/plug/rules", s.getPlugRules)
+	mux.HandleFunc("DELETE "+plugRulePrefix+"{id}", s.deletePlugRule)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
-		if allowed, ok := routes[r.URL.Path]; ok {
+		if allowed, ok := allowedMethods(r.URL.Path); ok {
 			w.Header().Set("Allow", allowed)
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -96,7 +119,13 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			return
 		}
 
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+		case http.MethodDelete:
+			// A DELETE has no body to describe. A web page on another
+			// site cannot make a browser send one without asking first,
+			// which this server never agrees to.
+		default:
 			// A web page on another site can make a browser send a form
 			// or plain-text request here, but not a JSON one without
 			// asking first. Insisting on JSON keeps such pages out.
@@ -269,6 +298,121 @@ func (s *Server) putSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logger().Info("replaced the schedule for an API request", "rules", len(next.Rules))
 	writeJSON(w, http.StatusOK, s.Store.Schedule())
+}
+
+// plugRulesResponse is the body of GET /api/plug/rules: the schedule the
+// plug keeps and runs by itself, which is separate from the one kasad runs.
+type plugRulesResponse struct {
+	// Enabled reports whether the plug's schedule as a whole is switched
+	// on. When it is not, none of the rules run.
+	Enabled bool `json:"enabled"`
+
+	Rules []plugRule `json:"rules"`
+}
+
+// plugRule is one of the plug's own rules.
+type plugRule struct {
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	Enabled bool   `json:"enabled"`
+
+	// Weekly reports whether this is the plain kind of rule, which
+	// switches the plug at a time of day on chosen days of every week and
+	// does nothing else. The schedule kasad runs is made of that kind.
+	Weekly bool `json:"weekly"`
+
+	// Repeats is false for a rule that runs once.
+	Repeats bool          `json:"repeats"`
+	Days    schedule.Days `json:"days"`
+
+	plugRuleMoment
+
+	// End is what the rule does a second time, later on. It is left out
+	// when the rule has no second action.
+	End *plugRuleMoment `json:"end,omitempty"`
+}
+
+// plugRuleMoment is one thing a rule on the plug does, and when.
+type plugRuleMoment struct {
+	// At says how the moment is timed: "time", "sunrise", "sunset" or
+	// "unknown".
+	At string `json:"at"`
+
+	// Time is the time of day as HH:MM, by the plug's clock. It is present
+	// only when At is "time".
+	Time string `json:"time,omitempty"`
+
+	// Action is "on", "off" or "unknown".
+	Action string `json:"action"`
+}
+
+func newPlugRuleMoment(timed plug.RuleTime, minute int, action plug.RuleAction) plugRuleMoment {
+	moment := plugRuleMoment{At: "unknown", Action: "unknown"}
+	switch {
+	case timed == plug.AtClockTime && minute >= 0 && minute < 24*60:
+		moment.At = "time"
+		moment.Time = schedule.TimeOfDay{Hour: minute / 60, Minute: minute % 60}.String()
+	case timed == plug.AtSunrise:
+		moment.At = "sunrise"
+	case timed == plug.AtSunset:
+		moment.At = "sunset"
+	}
+	switch action {
+	case plug.RuleOn:
+		moment.Action = "on"
+	case plug.RuleOff:
+		moment.Action = "off"
+	}
+	return moment
+}
+
+func newPlugRule(rule plug.Rule) plugRule {
+	described := plugRule{
+		ID:             rule.ID,
+		Name:           rule.Name,
+		Enabled:        rule.Enabled,
+		Weekly:         rule.Weekly(),
+		Repeats:        rule.Repeat,
+		Days:           schedule.Days(rule.Days),
+		plugRuleMoment: newPlugRuleMoment(rule.Time, rule.Minute, rule.Action),
+	}
+	if rule.EndAction != plug.RuleNone {
+		end := newPlugRuleMoment(rule.EndTime, rule.EndMinute, rule.EndAction)
+		described.End = &end
+	}
+	return described
+}
+
+func (s *Server) getPlugRules(w http.ResponseWriter, r *http.Request) {
+	rules, err := s.Plug.Rules(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	response := plugRulesResponse{
+		Enabled: rules.Enabled,
+		Rules:   make([]plugRule, 0, len(rules.List)),
+	}
+	for _, rule := range rules.List {
+		response.Rules = append(response.Rules, newPlugRule(rule))
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) deletePlugRule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	err := s.Plug.DeleteRule(r.Context(), id)
+	if errors.Is(err, plug.ErrNoSuchRule) {
+		writeError(w, http.StatusNotFound, "the plug has no rule with the id "+strconv.Quote(id))
+		return
+	}
+	if err != nil {
+		s.logger().Error("could not delete a rule from the plug for an API request", "rule", id, "error", err)
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	s.logger().Info("deleted a rule from the plug for an API request", "rule", id)
+	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 }
 
 // decodeBody decodes a JSON request body into v. Unknown fields and trailing

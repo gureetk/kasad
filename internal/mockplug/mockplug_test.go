@@ -370,3 +370,110 @@ func TestSetTimeRejectsBadArguments(t *testing.T) {
 		t.Errorf("a rejected set_time moved the clock to %v", got)
 	}
 }
+
+// Two made-up rules: on at 07:30 every day, and off at sunset at weekends,
+// the second one switched off.
+var testRules = []mockplug.Rule{
+	{
+		ID: "00000000000000000000000000000001", Name: "morning", Enable: 1, Repeat: 1,
+		Weekdays: [7]int{1, 1, 1, 1, 1, 1, 1}, StartOption: 0, StartMinute: 450, StartAction: 1, EndAction: -1,
+	},
+	{
+		ID: "00000000000000000000000000000002", Name: "dusk", Enable: 0, Repeat: 1,
+		Weekdays: [7]int{1, 0, 0, 0, 0, 0, 1}, StartOption: 2, StartMinute: 0, StartAction: 0, EndAction: -1,
+	},
+}
+
+func TestGetRules(t *testing.T) {
+	plug := startPlug(t)
+	plug.SetRules(testRules...)
+
+	reply := send(t, plug.Addr(), `{"schedule":{"get_rules":{}}}`)
+	raw := methods(t, reply["schedule"])["get_rules"]
+	if code := errCode(t, raw); code != 0 {
+		t.Fatalf("err_code = %d, want 0", code)
+	}
+
+	// The names here are the ones real hardware uses.
+	var got struct {
+		Enable  int                          `json:"enable"`
+		Version int                          `json:"version"`
+		Rules   []map[string]json.RawMessage `json:"rule_list"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	if got.Enable != 1 || got.Version != 2 || len(got.Rules) != 2 {
+		t.Fatalf("enable %d, version %d, %d rules; want 1, 2 and 2 rules", got.Enable, got.Version, len(got.Rules))
+	}
+	want := map[string]string{
+		"id": `"00000000000000000000000000000001"`, "name": `"morning"`, "enable": "1", "repeat": "1",
+		"wday": "[1,1,1,1,1,1,1]", "stime_opt": "0", "smin": "450", "sact": "1", "eact": "-1",
+	}
+	if len(got.Rules[0]) != len(want) {
+		t.Errorf("first rule has %d fields, want %d: %v", len(got.Rules[0]), len(want), got.Rules[0])
+	}
+	for field, value := range want {
+		if string(got.Rules[0][field]) != value {
+			t.Errorf("first rule: %s = %s, want %s", field, got.Rules[0][field], value)
+		}
+	}
+}
+
+func TestGetRulesWithNoRules(t *testing.T) {
+	plug := startPlug(t)
+	plug.SetScheduleEnabled(false)
+
+	reply := send(t, plug.Addr(), `{"schedule":{"get_rules":{}}}`)
+	var got struct {
+		Enable *int              `json:"enable"`
+		Rules  []json.RawMessage `json:"rule_list"`
+	}
+	raw := methods(t, reply["schedule"])["get_rules"]
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	if got.Rules == nil || len(got.Rules) != 0 {
+		t.Errorf("rule_list in %s, want an empty list", raw)
+	}
+	if got.Enable == nil || *got.Enable != 0 {
+		t.Errorf("enable in %s, want 0", raw)
+	}
+}
+
+func TestDeleteRule(t *testing.T) {
+	plug := startPlug(t)
+	plug.SetRules(testRules...)
+
+	reply := send(t, plug.Addr(), `{"schedule":{"delete_rule":{"id":"00000000000000000000000000000001"}}}`)
+	if code := errCode(t, methods(t, reply["schedule"])["delete_rule"]); code != 0 {
+		t.Fatalf("err_code = %d, want 0", code)
+	}
+	left := plug.Rules()
+	if len(left) != 1 || left[0].ID != "00000000000000000000000000000002" {
+		t.Errorf("rules left: %+v, want only the second", left)
+	}
+}
+
+func TestDeleteRuleRejectsWhatItCannotDelete(t *testing.T) {
+	plug := startPlug(t)
+	plug.SetRules(testRules...)
+
+	for _, args := range []string{`{"id":"no-such-rule"}`, `{}`, `{"id":7}`, `[]`} {
+		reply := send(t, plug.Addr(), `{"schedule":{"delete_rule":`+args+`}}`)
+		if code := errCode(t, methods(t, reply["schedule"])["delete_rule"]); code != -3 {
+			t.Errorf("delete_rule %s: err_code = %d, want -3", args, code)
+		}
+	}
+	if left := plug.Rules(); len(left) != 2 {
+		t.Errorf("%d rules left, want both", len(left))
+	}
+}
+
+func TestScheduleMethodsTheMockLacks(t *testing.T) {
+	plug := startPlug(t)
+	reply := send(t, plug.Addr(), `{"schedule":{"add_rule":{}}}`)
+	if code := errCode(t, methods(t, reply["schedule"])["add_rule"]); code != -2 {
+		t.Errorf("err_code = %d, want -2", code)
+	}
+}

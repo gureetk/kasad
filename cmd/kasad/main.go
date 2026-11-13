@@ -19,14 +19,20 @@ import (
 const usage = `Usage: kasad [flags] <command>
 
 Commands:
-  state   show the plug's state and clock
-  on      switch the relay on
-  off     switch the relay off
-  sync    set the plug's clock from this machine's clock
-  serve   run the schedule in the data directory, and keep the plug's clock set
+  state             show the plug's state and clock
+  on                switch the relay on
+  off               switch the relay off
+  sync              set the plug's clock from this machine's clock
+  rules             list the rules stored on the plug
+  delete-rule <id>  delete one of the rules stored on the plug
+  serve             run the schedule in the data directory, and keep the
+                    plug's clock set
 
 The plug keeps local time with no UTC offset. state, sync and serve assume
 that the plug is set to the same timezone as this machine.
+
+The rules stored on the plug are ones it runs by itself, such as those made
+with the vendor's app. They are separate from the schedule that serve runs.
 
 serve can also offer a web app and a JSON API, at the address given with
 -listen. If the environment variable KASAD_TOKEN is set, API requests must
@@ -38,6 +44,17 @@ Flags:
 // hostEnv names the environment variable that supplies the plug's address
 // when -host is not given.
 const hostEnv = "KASAD_HOST"
+
+// commands lists the commands and how many arguments each one takes.
+var commands = map[string]int{
+	"state":       0,
+	"on":          0,
+	"off":         0,
+	"sync":        0,
+	"rules":       0,
+	"delete-rule": 1,
+	"serve":       0,
+}
 
 // Exit codes.
 const (
@@ -90,20 +107,24 @@ func run(ctx context.Context, args []string, env environment) int {
 		return exitUsage
 	}
 
-	if flags.NArg() != 1 {
-		if flags.NArg() == 0 {
-			fmt.Fprintln(env.stderr, "kasad: no command given")
-		} else {
-			fmt.Fprintln(env.stderr, "kasad: expected one command, got", flags.NArg())
-		}
+	if flags.NArg() == 0 {
+		fmt.Fprintln(env.stderr, "kasad: no command given")
 		flags.Usage()
 		return exitUsage
 	}
 	command := flags.Arg(0)
-	switch command {
-	case "state", "on", "off", "sync", "serve":
-	default:
+	wantArgs, known := commands[command]
+	if !known {
 		fmt.Fprintf(env.stderr, "kasad: unknown command %q\n", command)
+		flags.Usage()
+		return exitUsage
+	}
+	if flags.NArg()-1 != wantArgs {
+		if wantArgs == 0 {
+			fmt.Fprintln(env.stderr, "kasad: expected one command, got", flags.NArg())
+		} else {
+			fmt.Fprintf(env.stderr, "kasad: %s takes the id of one rule, as listed by the rules command\n", command)
+		}
 		flags.Usage()
 		return exitUsage
 	}
@@ -137,6 +158,10 @@ func run(ctx context.Context, args []string, env environment) int {
 		err = switchRelay(ctx, p, false, env)
 	case "sync":
 		err = syncClock(ctx, p, env)
+	case "rules":
+		err = listRules(ctx, p, env)
+	case "delete-rule":
+		err = deleteRule(ctx, p, flags.Arg(1), env)
 	case "serve":
 		err = serve(ctx, p, serveOptions{
 			dataDir:      *dataDir,

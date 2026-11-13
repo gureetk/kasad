@@ -523,6 +523,27 @@ func TestServeWebApp(t *testing.T) {
 	s.stop()
 }
 
+func TestServeOffersThePlugsOwnRules(t *testing.T) {
+	mock := startMock(t)
+	mock.SetRules(plugRules...)
+	s := startServe(t, mock, t.TempDir(), "-sync-interval", "0", "-listen", "127.0.0.1:0")
+
+	code, body := s.request("GET", "/api/plug/rules", "", nil)
+	if code != http.StatusOK || !strings.Contains(body, `"id": "00000000000000000000000000000002"`) {
+		t.Fatalf("GET /api/plug/rules = %d:\n%s", code, body)
+	}
+
+	code, body = s.request("DELETE", "/api/plug/rules/00000000000000000000000000000002", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("DELETE = %d:\n%s", code, body)
+	}
+	if left := mock.Rules(); len(left) != 2 {
+		t.Errorf("%d rules left on the plug, want 2", len(left))
+	}
+	s.waitForLog("deleted a rule from the plug")
+	s.stop()
+}
+
 func TestServeWarnsAboutAnOpenAPI(t *testing.T) {
 	mock := startMock(t)
 
