@@ -1,0 +1,59 @@
+name: Pages
+
+# Publishes the project page in site/static to GitHub Pages whenever a change
+# to it reaches main. It can also be run by hand from main, for example once
+# Pages has been switched on in the repository's settings.
+#
+# A pull request that changes the page runs its test and builds what would be
+# published, without publishing it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/pages.yml
+      - site/**
+  pull_request:
+    paths:
+      - .github/workflows/pages.yml
+      - site/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One publish at a time, and one that has started is left to finish. A pull
+# request's run is replaced by a newer one for the same pull request.
+concurrency:
+  group: pages-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - run: node --test
+        working-directory: site
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site/static
+
+  publish:
+    name: Publish
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write # to publish the page
+      id-token: write # to show that the publish comes from this workflow
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - id: publish
+        uses: actions/deploy-pages@v5
