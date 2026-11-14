@@ -38,3 +38,6 @@ go.work.sum
 # OS files
 .DS_Store
 Thumbs.db
+
+# A filled-in copy of contrib/kasad.env.example, which holds a password
+kasad.env

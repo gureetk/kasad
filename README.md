@@ -16,13 +16,114 @@ Early. What works today:
 - offer a web app for switching the plug and editing both kinds of rule
 - offer a JSON API for the plug and the schedule
 
-## Build
+## Install
+
+kasad is one binary with nothing to install beside it. There are three ways
+to get it. `kasad version` says which version is running.
+
+### A release, run by systemd
+
+Each [release](https://github.com/gureetk/kasad/releases) has an archive for
+64-bit Intel and AMD machines (`linux-amd64`), 64-bit ARM (`linux-arm64`) and
+32-bit ARM (`linux-armv7` for a Raspberry Pi 2 or later, `linux-armv6` for
+the first Pi and the Pi Zero). `SHA256SUMS` lists their checksums.
+
+```
+tar -xzf kasad-v1.2.3-linux-arm64.tar.gz
+cd kasad-v1.2.3-linux-arm64
+sudo install kasad /usr/local/bin/
+sudo install -m 600 kasad.env.example /etc/kasad.env
+sudo install -m 644 kasad.service /etc/systemd/system/
+```
+
+Edit `/etc/kasad.env`: set `KASAD_HOST` to the plug's address, and
+`KASAD_LISTEN` and `KASAD_PASSWORD` if you want the web app. Then:
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable --now kasad
+```
+
+The unit runs kasad as a user of its own and keeps its files in
+`/var/lib/kasad`. Logs go to the journal: `journalctl -u kasad`.
+
+### A container
+
+Each release is also an image, for the same kinds of machine:
+
+```
+docker run -d --name kasad --restart unless-stopped \
+  -e KASAD_HOST=192.0.2.10 \
+  -e KASAD_PASSWORD='a phrase of your own' \
+  -e TZ=Europe/Lisbon \
+  -p 8080:8080 -v kasad-data:/data \
+  ghcr.io/gureetk/kasad:latest
+```
+
+The web app is then on port 8080 of the machine. `contrib/compose.yaml` is
+the same thing as a Compose file that reads its settings from `kasad.env`.
+
+Things to know:
+
+- **Set `TZ`.** Rules run by local time, and the plug's clock is set to it.
+  In a container local time is UTC unless `TZ` names a timezone. kasad logs
+  the time it starts by, with its offset from UTC, so the log shows whether
+  it has the right one.
+- **The image listens on port 8080** inside the container and keeps its files
+  in `/data`. Set a password whenever the port is published to other
+  machines.
+- **The container has to be able to reach the plug** on TCP port 9999. The
+  plug sees the address of the machine Docker runs on.
+- **It does not run as root.** kasad runs as user 65532. A named volume, as
+  above, is writable by it from the start. A directory of the host mounted on
+  `/data` has to be made writable by that user.
+- The image holds the binary and nothing else, so there is no shell in it to
+  `docker exec`.
+
+To build the image from a checkout instead: `docker build -t kasad .`
+
+### From source
 
 Go 1.22 or newer. There are no third-party dependencies.
 
 ```
+go install github.com/gureetk/kasad/cmd/kasad@latest
+```
+
+Or, in a checkout:
+
+```
 go build ./cmd/kasad
 ```
+
+## Settings
+
+Every flag can also be set through the environment, so a deployment can keep
+all its settings in one file. A flag on the command line wins.
+
+| Flag | Variable | What it sets |
+|---|---|---|
+| `-host` | `KASAD_HOST` | The plug's address, as a host or `host:port` |
+| `-timeout` | `KASAD_TIMEOUT` | How long to wait for the plug to answer (default `5s`) |
+| `-data` | `KASAD_DATA` | `serve`: the directory kasad keeps its files in (default: the current one) |
+| `-sync-interval` | `KASAD_SYNC_INTERVAL` | `serve`: how often to set the plug's clock (default `1h`, `0` for never) |
+| `-listen` | `KASAD_LISTEN` | `serve`: the address to offer the web app and the JSON API on (default: neither) |
+| | `KASAD_PASSWORD` | `serve`: the password people sign in to the web app with |
+| | `KASAD_TOKEN` | `serve`: a token for programs that use the API |
+
+The password and the token have no flags, because a command line can be read
+by every user of the machine.
+
+Either can be kept in a file of its own instead: set `KASAD_PASSWORD_FILE` or
+`KASAD_TOKEN_FILE` to the file's path. That is how Docker secrets and
+systemd credentials hand a secret over, and it keeps the secret out of the
+process's environment. The line ending at the end of the file is not part of
+the secret. `serve` refuses to start if the file cannot be read or is empty,
+or if the variable and its `_FILE` are both set.
+
+kasad does not read a settings file itself. systemd does that with
+`EnvironmentFile=`, and Docker with `--env-file` or `env_file:`.
+`contrib/kasad.env.example` is a file to start from.
 
 ## One-off commands
 
@@ -108,7 +209,7 @@ How `serve` behaves:
 - **Manual switching.** `serve` only acts when a rule falls due. Switching the
   plug by hand in between is left alone until the next rule.
 
-`contrib/kasad.service` is a sample systemd unit.
+To run it as a service, see "Install" above.
 
 ## Rules stored on the plug
 
@@ -397,6 +498,12 @@ cookie is marked for HTTPS only.
 - `cmd/kasad`: the command-line tool.
 - `internal/atomicfile`: replaces a file in one step, for the files kasad
   keeps in its data directory.
+- `contrib`: a systemd unit, a Compose file and a settings file to start
+  from.
+- `Dockerfile`, `scripts/dist.sh`: how the image and the release archives
+  are built.
+- `.github/workflows`: the tests that run on every pull request, and the
+  making of a release.
 - `internal/mockplug`: an in-memory mock plug, so the tests run without
   hardware.
 
@@ -423,3 +530,30 @@ need Node.js.
 ```
 cd internal/web && node --test
 ```
+
+Both sets run on every pull request.
+
+## Releasing
+
+A release is made by pushing a tag:
+
+```
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+The `Release` workflow then:
+
+1. runs the tests;
+2. builds the archives with `scripts/dist.sh` and publishes them as a GitHub
+   release, with notes drawn from the pull requests merged since the last
+   one;
+3. builds the image and pushes it to `ghcr.io` as `1.2.3`, `1.2` and
+   `latest`.
+
+A tag with a hyphen, such as `v1.2.3-rc.1`, makes a pre-release, and leaves
+`1.2` and `latest` where they were.
+
+A pull request that changes how a release is built goes through the same
+steps without publishing anything. `scripts/dist.sh v0.0.0-try` builds the
+archives into `dist/` by hand.

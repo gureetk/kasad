@@ -1,0 +1,27 @@
+# A sample Compose file for kasad.
+#
+# 1. Copy kasad.env.example to kasad.env beside this file. In it, set
+#    KASAD_HOST to the plug's address and KASAD_PASSWORD to a password.
+# 2. Set TZ below to the timezone the plug is in.
+# 3. Run: docker compose up -d
+#
+# The web app is then at http://<this machine>:8080/
+
+services:
+  kasad:
+    image: ghcr.io/gureetk/kasad:latest
+    restart: unless-stopped
+    env_file: kasad.env
+    environment:
+      # Rules run by local time, and the plug's clock is set to it. In a
+      # container local time is UTC unless this names a timezone.
+      TZ: Europe/Lisbon
+    ports:
+      # To offer the web app to this machine only, write "127.0.0.1:8080:8080".
+      - "8080:8080"
+    volumes:
+      # The schedule, and what kasad remembers between runs.
+      - kasad-data:/data
+
+volumes:
+  kasad-data:
