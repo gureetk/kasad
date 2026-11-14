@@ -5,7 +5,7 @@ TCP port 9999. kasad talks to the plug directly over the LAN, with no cloud
 account and no internet connection.
 
 The project page, with screenshots of the web app, is at
-<https://gureetk.github.io/kasad/>.
+<https://kasad.gureet.ca/>.
 
 ## Status
 
@@ -621,16 +621,21 @@ archives into `dist/` by hand.
 
 ## Project page
 
-`site/static` is the page at <https://gureetk.github.io/kasad/>: plain HTML,
-CSS and JavaScript with no build step, and nothing loaded from anywhere
-else. It follows the device's light or dark setting, and has a switch to
-choose one instead.
+`site/static` is the page at <https://kasad.gureet.ca/>: plain HTML, CSS
+and JavaScript with no build step, and nothing loaded from anywhere else. It
+follows the device's light or dark setting, and has a switch to choose one
+instead.
 
 The `Pages` workflow publishes it whenever a change to it reaches `main`. A
 pull request that changes it runs its test and builds what would be
 published, without publishing it. Publishing needs the repository's Pages
 source set to GitHub Actions, once, under Settings, Pages. After that the
 workflow can also be run by hand from the Actions page.
+
+The address is the custom domain set in the same place, and GitHub's own
+address for the page, `gureetk.github.io/kasad`, sends visitors there. The
+page names its address in its `canonical` and `og:` tags, so change those
+too if the domain ever changes.
 
 To look at it before publishing, serve the folder, since its scripts are
 modules and a browser will not run them from a file:
