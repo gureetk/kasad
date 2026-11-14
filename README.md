@@ -4,6 +4,9 @@ Offline control for TP-Link Kasa smart plugs that speak the local protocol on
 TCP port 9999. kasad talks to the plug directly over the LAN, with no cloud
 account and no internet connection.
 
+The project page, with screenshots of the web app, is at
+<https://gureetk.github.io/kasad/>.
+
 ## Status
 
 Early. What works today:
@@ -544,10 +547,12 @@ cookie is marked for HTTPS only.
   from.
 - `Dockerfile`, `scripts/dist.sh`: how the image and the release archives
   are built.
-- `.github/workflows`: the tests that run on every pull request, and the
-  making of a release.
+- `.github/workflows`: the tests that run on every pull request, the making
+  of a release, and the publishing of the project page.
 - `internal/mockplug`: an in-memory mock plug, so the tests run without
   hardware.
+- `site`: the project page. `static` holds the page as it is served, with no
+  build step; `jstest` holds a test of its protocol demonstration.
 
 ## Security
 
@@ -574,6 +579,14 @@ cd internal/web && node --test
 ```
 
 Both sets run on every pull request.
+
+The project page's demonstration of the protocol is checked against the same
+test vector as the Go code. That test runs on any pull request that changes
+the page:
+
+```
+cd site && node --test
+```
 
 ## Releasing
 
@@ -605,3 +618,30 @@ going by the workflow as it is on `main`.
 A pull request that changes how a release is built goes through the same
 steps without publishing anything. `scripts/dist.sh v0.0.0-try` builds the
 archives into `dist/` by hand.
+
+## Project page
+
+`site/static` is the page at <https://gureetk.github.io/kasad/>: plain HTML,
+CSS and JavaScript with no build step, and nothing loaded from anywhere
+else. It follows the device's light or dark setting, and has a switch to
+choose one instead.
+
+The `Pages` workflow publishes it whenever a change to it reaches `main`. A
+pull request that changes it runs its test and builds what would be
+published, without publishing it. Publishing needs the repository's Pages
+source set to GitHub Actions, once, under Settings, Pages. After that the
+workflow can also be run by hand from the Actions page.
+
+To look at it before publishing, serve the folder, since its scripts are
+modules and a browser will not run them from a file:
+
+```
+python3 -m http.server -d site/static
+```
+
+then open `http://localhost:8000/`.
+
+The screenshots show the web app run against the mock plug the tests use,
+with made-up rules. The page names the current release in two places, the
+note at the top and the archive names under Install, so change both when
+making a release.
