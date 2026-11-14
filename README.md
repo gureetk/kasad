@@ -60,8 +60,50 @@ docker run -d --name kasad --restart unless-stopped \
   ghcr.io/gureetk/kasad:latest
 ```
 
-The web app is then on port 8080 of the machine. `contrib/compose.yaml` is
-the same thing as a Compose file that reads its settings from `kasad.env`.
+The web app is then on port 8080 of the machine.
+
+Or with Docker Compose. Put this in a file named `compose.yaml`, with your
+own values for the three settings:
+
+```yaml
+services:
+  kasad:
+    image: ghcr.io/gureetk/kasad:latest
+    restart: unless-stopped
+    environment:
+      KASAD_HOST: 192.0.2.10
+      KASAD_PASSWORD: a phrase of your own
+      TZ: Europe/Lisbon
+    ports:
+      - "8080:8080"
+    volumes:
+      - kasad-data:/data
+
+volumes:
+  kasad-data:
+```
+
+Then, in the same directory:
+
+```
+docker compose up -d
+docker compose logs -f
+```
+
+To move to a newer release later:
+
+```
+docker compose pull
+docker compose up -d
+```
+
+`latest` is the newest release that is not a pre-release. To stay on one
+version, or to run a pre-release, name it instead, as in
+`ghcr.io/gureetk/kasad:0.1.0`.
+
+`contrib/compose.yaml` is a variant that reads the settings from a
+`kasad.env` file beside it, which keeps the password out of the Compose
+file.
 
 Things to know:
 
