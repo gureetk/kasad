@@ -1,7 +1,13 @@
 name: Release
 
-# Pushing a tag such as v1.2.3 makes a release: archives of the binary on the
-# repository's Releases page, and a container image on ghcr.io.
+# A tag such as v1.2.3 makes a release: archives of the binary on the
+# repository's Releases page, and a container image on ghcr.io. The tag can
+# be pushed with git, or made by publishing a release on GitHub, in which
+# case the archives are added to that release.
+#
+# Run by hand, it does the same for a tag that already exists. That is for a
+# release whose own run failed: this file is then read from the main branch,
+# not from the tag.
 #
 # A pull request that changes how a release is built goes through the same
 # steps without publishing anything, so that a change is tried before a
@@ -12,6 +18,12 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to release, such as v1.2.3. It has to exist already.
+        required: true
+        type: string
   pull_request:
     paths:
       - .github/workflows/release.yml
@@ -24,12 +36,19 @@ on:
 permissions:
   contents: read
 
+# One run at a time for a tag, so that two do not publish over each other.
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+
 env:
-  # On a tag, the tag itself. Otherwise a name that cannot be mistaken for a
-  # release.
-  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('v0.0.0-{0}', github.sha) }}
-  # A tag with a hyphen, such as v1.2.3-rc.1, is a pre-release.
-  PRERELEASE: ${{ contains(github.ref_name, '-') }}
+  # The tag being released: the one given by hand, or the one pushed. Empty
+  # for a pull request, which publishes nothing.
+  TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+  # The version built into the binary. For a pull request it is a name that
+  # cannot be mistaken for a release.
+  VERSION: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || format('v0.0.0-{0}', github.sha) }}
+  # For the gh command.
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   binaries:
@@ -38,7 +57,17 @@ jobs:
     permissions:
       contents: write # to create the release
     steps:
+      - name: Check the tag given by hand
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::\"$TAG\" does not look like v1.2.3"
+            exit 1
+          fi
       - uses: actions/checkout@v7
+        with:
+          # The tag given by hand. Otherwise what the run was started for.
+          ref: ${{ inputs.tag }}
       - uses: actions/setup-go@v7
         with:
           go-version: stable
@@ -54,16 +83,24 @@ jobs:
           tar -xzf "dist/kasad-$VERSION-linux-amd64.tar.gz"
           "kasad-$VERSION-linux-amd64/kasad" version | tee /dev/stderr | grep -qF "kasad $VERSION "
       - name: Publish the release
-        if: github.ref_type == 'tag'
+        if: env.TAG != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          flags=()
-          if [ "$PRERELEASE" = true ]; then
-            flags+=(--prerelease)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # The release is there already: made on GitHub, which is what
+            # made the tag, or by an earlier run. Its title, notes and
+            # pre-release mark are left as they are, and the files are added.
+            gh release upload "$TAG" dist/* --clobber
+          else
+            flags=()
+            # A tag with a hyphen, such as v1.2.3-rc.1, is a pre-release.
+            if [[ "$TAG" == *-* ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$TAG" dist/* \
+              --verify-tag --title "$TAG" --generate-notes "${flags[@]}"
           fi
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes "${flags[@]}"
 
   image:
     name: Container image
@@ -75,6 +112,8 @@ jobs:
       packages: write # to push the image
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
       - name: Build the image for this machine and try it
         run: |
           docker build --build-arg VERSION="$VERSION" -t kasad:try .
@@ -95,20 +134,24 @@ jobs:
       - name: Set up a builder for several kinds of machine
         run: docker buildx create --use
       - name: Sign in to ghcr.io
-        if: github.ref_type == 'tag'
+        if: env.TAG != ''
         env:
           TOKEN: ${{ github.token }}
         run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Build the image for every kind of machine, and push it for a release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # ghcr.io wants the name in lower case.
           image=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           number=${VERSION#v}
           publish=()
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
+          if [ -n "$TAG" ]; then
             publish+=(--push --tag "$image:$number")
-            if [ "$PRERELEASE" != true ]; then
-              # 1.2.3 is also the newest 1.2, and the newest of all.
+            # The release exists by now: the job above made it or found it.
+            # 1.2.3 is also the newest 1.2, and the newest of all, unless
+            # the release is marked as a pre-release.
+            if [ "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = false ]; then
               publish+=(--tag "$image:${number%.*}" --tag "$image:latest")
             fi
           fi
