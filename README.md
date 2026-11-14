@@ -535,24 +535,30 @@ Both sets run on every pull request.
 
 ## Releasing
 
-A release is made by pushing a tag:
+A release is made from a version tag. Either push one:
 
 ```
 git tag v1.2.3
 git push origin v1.2.3
 ```
 
-The `Release` workflow then:
+or publish a release on GitHub's Releases page and have it make a new tag of
+that form. Either way the `Release` workflow then:
 
 1. runs the tests;
 2. builds the archives with `scripts/dist.sh` and publishes them as a GitHub
    release, with notes drawn from the pull requests merged since the last
-   one;
-3. builds the image and pushes it to `ghcr.io` as `1.2.3`, `1.2` and
-   `latest`.
+   one. If the release was made on GitHub, the archives are added to it and
+   its title and notes are left alone;
+3. builds the image and pushes it to `ghcr.io` as `1.2.3` and, unless it is
+   a pre-release, as `1.2` and `latest` too.
 
-A tag with a hyphen, such as `v1.2.3-rc.1`, makes a pre-release, and leaves
-`1.2` and `latest` where they were.
+A tag with a hyphen, such as `v1.2.3-rc.1`, is published as a pre-release. A
+release made on GitHub is a pre-release if it is marked as one there.
+
+If a release's run fails, fix the cause on `main`, then run the workflow by
+hand from the Actions page and give it the tag. It builds that tag again,
+going by the workflow as it is on `main`.
 
 A pull request that changes how a release is built goes through the same
 steps without publishing anything. `scripts/dist.sh v0.0.0-try` builds the
